@@ -124,7 +124,7 @@ class AsyncImageCrawler:
         logger.info("Calling _create_directories()")
         self._create_directories()
 
-        self.file_handler = None # basic handler not needed as we handle paths locally
+        self.file_handler = None  # basic handler not needed as we handle paths locally
 
     def _get_extension_from_type(self, asset_type: str) -> str:
         """Get file extension from asset type."""
@@ -152,8 +152,6 @@ class AsyncImageCrawler:
         except Exception as e:
             logger.error(f"Error downloading {url}: {e}")
             return False
-
-
 
     def _create_directories(self):
         """Create all necessary output directories"""
@@ -682,6 +680,63 @@ class AsyncImageCrawler:
         logger.debug(f"Generated hash: {hash_value}")
         return hash_value
 
+    async def get_visual_container(self, img_element, page):
+        """
+        Find the closest parent container that visualy wraps the image and likely contains overlay text.
+        Returns the container element handle, or the image element itself if no such container is found.
+        """
+        return await img_element.evaluate_handle('''img => {
+            function getVisibleText(element) {
+                return element.innerText && element.innerText.trim().length > 0;
+            }
+
+            let current = img.parentElement;
+            const imgRect = img.getBoundingClientRect();
+            
+            // Traverse up max 3 levels to find a container
+            for (let i = 0; i < 3; i++) {
+                if (!current || current.tagName === 'BODY' || current.tagName === 'HTML') break;
+                
+                const rect = current.getBoundingClientRect();
+                
+                // Heuristic: Container shouldn't be vastly larger than image (e.g. < 4x area)
+                const areaRatio = (rect.width * rect.height) / (imgRect.width * imgRect.height);
+                
+                if (areaRatio > 4) {
+                    break; 
+                }
+
+                // Check for potential overlay siblings
+                const children = Array.from(current.children);
+                const hasOverlaySibling = children.some(child => {
+                    if (child === img) return false;
+                    
+                    const childStyle = window.getComputedStyle(child);
+                    const childRect = child.getBoundingClientRect();
+                    
+                    // Check intersection with image
+                    const intersect = !(childRect.right < imgRect.left || 
+                                      childRect.left > imgRect.right || 
+                                      childRect.bottom < imgRect.top || 
+                                      childRect.top > imgRect.bottom);
+                    
+                    const hasText = getVisibleText(child);
+                    const isAbsolute = childStyle.position === 'absolute';
+                    
+                    return (isAbsolute || intersect) && hasText;
+                });
+
+                if (hasOverlaySibling) {
+                    return current;
+                }
+                
+                current = current.parentElement;
+            }
+            
+            return img;
+        }''')
+
+
     async def crawl_page(self, url: str, max_depth: int = 2, current_depth: int = 0):
         """Crawl a single page and extract images"""
         logger.info(f"Starting crawl_page: url={url}, max_depth={max_depth}, current_depth={current_depth}")
@@ -758,7 +813,6 @@ class AsyncImageCrawler:
                 # === GLOBAL ASSET EXTRACTION ===
                 # Removed per user request to use only Playwright and skip global assets
 
-
                 # Find all images
                 logger.info("Locating all <img> elements on page")
                 images = await page.locator('img').all()
@@ -813,9 +867,12 @@ class AsyncImageCrawler:
 
                         # Handle data URIs
                         if src.startswith('data:'):
-                            logger.debug(f"Image {idx + 1} is a data URI - SKIPPING per user request")
-                            skipped_data_uri += 1
-                            continue
+                            if not self.include_data_uris:
+                                logger.debug(f"Image {idx + 1} is a data URI - SKIPPING per user request")
+                                skipped_data_uri += 1
+                                continue
+                            else:
+                                logger.debug(f"Image {idx + 1} is a data URI - Including")
 
                         # Make absolute URL
                         logger.debug("Converting to absolute URL")
@@ -855,47 +912,79 @@ class AsyncImageCrawler:
                         screenshot_path = f"{img_dir}/{filename}"
                         logger.debug(f"Full screenshot path: {screenshot_path}")
 
-                        # === CHANGED: DOWNLOAD ORIGINAL FILE INSTEAD OF SCREENSHOT ===
+                        # === CHECK FOR OVERLAY CONTAINER ===
+                        logger.debug("Checking for overlay container")
                         try:
-                            # Use aiohttp to download the original source
-                            async with aiohttp.ClientSession() as session:
-                                logger.debug(f"Downloading original image to {screenshot_path}")
-                                
-                                # Fix extension if needed - we want the original file extension
-                                # The filename was generated as .png by default above, let's look at the src extension
-                                original_ext = os.path.splitext(urlparse(absolute_src).path)[1]
-                                if original_ext:
-                                    # Update filename (and screenshot_path) to match original extension
-                                    if not filename.endswith(original_ext):
-                                        filename = f"img_{img_hash}{original_ext}"
-                                        screenshot_path = f"{img_dir}/{filename}"
-                                
-                                success = await self._download_file(session, absolute_src, screenshot_path)
-                                
-                                if success:
-                                    logger.info(f"✓ Image downloaded: {screenshot_path}")
-                                    print(f"  ✓ Downloaded: {filename}")
-                                else:
-                                    logger.warning(f"Failed to download {absolute_src}, fallback/skipping")
-                                    print(f"  ✗ Failed to download: {filename}")
-                                    continue # Skip if download failed
+                            container = await self.get_visual_container(img, page)
+                            # Check if container is different from img (by comparing tag name or handle)
+                            # Simple check: evaluate if they are the same node
+                            is_overlay_container = await page.evaluate('(args) => args[0] !== args[1]', [container, img])
+                            
+                            if is_overlay_container:
+                                logger.info("Overlay container detected! Will screenshot container instead of image.")
+                                print("    Overlay container detected")
+                        except Exception as e:
+                            logger.warning(f"Error checking for overlay container: {e}")
+                            is_overlay_container = False
+                            container = img
 
-                                # Print classification details
-                                print(f"    Type: {classification.type}")
-                                if classification.sub_type:
-                                    print(f"    Sub-type: {classification.sub_type}")
-                                if classification.is_logo:
-                                    print(f"    Logo: Yes")
-                                if classification.is_icon:
-                                    print(f"    Icon: Yes")
-                                if classification.is_button:
-                                    print(f"    Button Image: Yes")
-                                if alt_text:
-                                    print(f"    Alt text: {alt_text[:60]}{'...' if len(alt_text) > 60 else ''}")
+                        # === SCREENSHOT FOR TEXT IMAGES, LOGOS, AND OVERLAYS ===
+                        try:
+                            # Determine if we should screenshot or download
+                            # Screenshot if:
+                            # 1. It's a text image or logo (legacy logic)
+                            # 2. It has an overlay container (new logic)
+                            should_screenshot = classification.is_text_image or classification.is_logo or is_overlay_container
+
+                            if should_screenshot:
+                                # Update target element for screenshot
+                                target_element = container if is_overlay_container else img
+                                reason = "overlay container" if is_overlay_container else "text image/logo"
+                                
+                                logger.debug(
+                                    f"Taking screenshot of {reason} to {screenshot_path}")
+                                await target_element.screenshot(path=screenshot_path)
+                                logger.info(f"✓ Screenshot taken: {screenshot_path}")
+                                print(f"  ✓ Screenshot saved ({reason}): {filename}")
+                            else:
+                                # Download original file for other images
+                                async with aiohttp.ClientSession() as session:
+                                    logger.debug(f"Downloading original image to {screenshot_path}")
+
+                                    # Fix extension if needed - we want the original file extension
+                                    original_ext = os.path.splitext(urlparse(absolute_src).path)[1]
+                                    if original_ext:
+                                        # Update filename (and screenshot_path) to match original extension
+                                        if not filename.endswith(original_ext):
+                                            filename = f"img_{img_hash}{original_ext}"
+                                            screenshot_path = f"{img_dir}/{filename}"
+
+                                    success = await self._download_file(session, absolute_src, screenshot_path)
+
+                                    if success:
+                                        logger.info(f"✓ Image downloaded: {screenshot_path}")
+                                        print(f"  ✓ Downloaded: {filename}")
+                                    else:
+                                        logger.warning(f"Failed to download {absolute_src}, fallback/skipping")
+                                        print(f"  ✗ Failed to download: {filename}")
+                                        continue  # Skip if download failed
+
+                            # Print classification details
+                            print(f"    Type: {classification.type}")
+                            if classification.sub_type:
+                                print(f"    Sub-type: {classification.sub_type}")
+                            if classification.is_logo:
+                                print(f"    Logo: Yes")
+                            if classification.is_icon:
+                                print(f"    Icon: Yes")
+                            if classification.is_button:
+                                print(f"    Button Image: Yes")
+                            if alt_text:
+                                print(f"    Alt text: {alt_text[:60]}{'...' if len(alt_text) > 60 else ''}")
 
                         except Exception as e:
-                            logger.error(f"Failed to download image {idx + 1}: {str(e)}")
-                            print(f"  ✗ Failed to download {filename}: {str(e)}")
+                            logger.error(f"Failed to capture image {idx + 1}: {str(e)}")
+                            print(f"  ✗ Failed to capture {filename}: {str(e)}")
                             continue
 
                         # Store image data using Pydantic model
@@ -1082,7 +1171,7 @@ class AsyncImageCrawler:
         print(f"Report saved to: {output_file}")
         print(f"Debug log saved to: crawler_debug.log")
         print("=" * 60)
-        
+
         # Export images with alt text to CSV
         logger.info("Exporting images with alt text to CSV")
         self.export_alt_text_csv()
@@ -1092,16 +1181,16 @@ class AsyncImageCrawler:
         logger.info("Starting export_alt_text_csv")
         csv_file = f"{self.output_dir}/images_with_alt_text.csv"
         logger.debug(f"CSV output file: {csv_file}")
-        
+
         # Export images with alt text to CSV
         images_to_export = [img for img in self.images_data if img.alt_text and img.alt_text.strip()]
         logger.info(f"Preparing to export {len(images_to_export)} images to CSV")
-        
+
         if len(images_to_export) == 0:
             logger.warning("No images found, skipping CSV export")
             print("⚠ No images found")
             return
-        
+
         # Define CSV headers
         headers = [
             'Image Filename',
@@ -1119,14 +1208,14 @@ class AsyncImageCrawler:
             'Is Text Image',
             'File Format'
         ]
-        
+
         # Write CSV
         logger.info(f"Writing CSV to {csv_file}")
         try:
             with open(csv_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=headers)
                 writer.writeheader()
-                
+
                 for img in images_to_export:
                     writer.writerow({
                         'Image Filename': img.filename,
@@ -1144,10 +1233,10 @@ class AsyncImageCrawler:
                         'Is Text Image': 'Yes' if img.is_text_image else 'No',
                         'File Format': img.file_format or 'N/A'
                     })
-            
+
             logger.info(f"✓ CSV export successful: {csv_file}")
             print(f"\n✓ Exported {len(images_to_export)} images to: {csv_file}")
-            
+
         except Exception as e:
             logger.error(f"Error writing CSV: {str(e)}")
             print(f"✗ Error exporting CSV: {str(e)}")
