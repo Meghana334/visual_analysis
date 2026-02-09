@@ -1,3 +1,20 @@
 .env
 crawled_images
+
+# Logs
+logs/
+*.log
+
+# Python cache
 __pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor junk
+.DS_Store
+.idea/
+.vscode/
