@@ -1093,13 +1093,13 @@ class AsyncImageCrawler:
         csv_file = f"{self.output_dir}/images_with_alt_text.csv"
         logger.debug(f"CSV output file: {csv_file}")
         
-        # Filter images that have alt text
-        images_with_alt = [img for img in self.images_data if img.alt_text.strip()]
-        logger.info(f"Found {len(images_with_alt)} images with alt text out of {len(self.images_data)} total")
+        # Export images with alt text to CSV
+        images_to_export = [img for img in self.images_data if img.alt_text and img.alt_text.strip()]
+        logger.info(f"Preparing to export {len(images_to_export)} images to CSV")
         
-        if len(images_with_alt) == 0:
-            logger.warning("No images with alt text found, skipping CSV export")
-            print("⚠ No images with alt text found")
+        if len(images_to_export) == 0:
+            logger.warning("No images found, skipping CSV export")
+            print("⚠ No images found")
             return
         
         # Define CSV headers
@@ -1127,7 +1127,7 @@ class AsyncImageCrawler:
                 writer = csv.DictWriter(f, fieldnames=headers)
                 writer.writeheader()
                 
-                for img in images_with_alt:
+                for img in images_to_export:
                     writer.writerow({
                         'Image Filename': img.filename,
                         'Image URL': img.url,
@@ -1146,7 +1146,7 @@ class AsyncImageCrawler:
                     })
             
             logger.info(f"✓ CSV export successful: {csv_file}")
-            print(f"\n✓ Exported {len(images_with_alt)} images with alt text to: {csv_file}")
+            print(f"\n✓ Exported {len(images_to_export)} images to: {csv_file}")
             
         except Exception as e:
             logger.error(f"Error writing CSV: {str(e)}")

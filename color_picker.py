@@ -1,154 +1,139 @@
 import cv2
 import numpy as np
+import easyocr
 from collections import Counter
 
+# -------------------------
+# Utilities
+# -------------------------
 
 def rgb_to_hex(rgb):
-    """Convert RGB tuple to hex color code"""
     return '#{:02x}{:02x}{:02x}'.format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
 
-def get_dominant_colors(image_path, num_colors=10):
-    """
-    Extract dominant colors from an image
+def relative_luminance(rgb):
+    rgb = np.array(rgb) / 255.0
+    rgb = np.where(rgb <= 0.03928, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 
-    Args:
-        image_path: Path to the image file
-        num_colors: Number of dominant colors to extract
 
-    Returns:
-        List of tuples containing (hex_code, rgb_tuple, percentage)
-    """
-    # Read the image
-    img = cv2.imread(image_path)
+# -------------------------
+# KMeans helper
+# -------------------------
 
-    if img is None:
-        raise ValueError("Could not read the image file")
+def cluster_colors(pixels, k):
+    pixels = np.float32(pixels)
+    _, labels, centers = cv2.kmeans(
+        pixels, k, None,
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2),
+        10, cv2.KMEANS_RANDOM_CENTERS
+    )
 
-    # Convert BGR to RGB (OpenCV uses BGR by default)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    counts = Counter(labels.flatten())
+    total = sum(counts.values())
 
-    # Reshape image to be a list of pixels
-    pixels = img_rgb.reshape(-1, 3)
-
-    # Use K-means clustering to find dominant colors
-    pixels_float = np.float32(pixels)
-
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.1)
-    _, labels, palette = cv2.kmeans(pixels_float, num_colors, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-    # Count the occurrences of each cluster
-    _, counts = np.unique(labels, return_counts=True)
-
-    # Sort colors by frequency
-    indices = np.argsort(counts)[::-1]
-
-    # Calculate percentages and create result list
-    total_pixels = len(pixels)
     colors = []
-
-    for idx in indices:
-        rgb = palette[idx]
-        percentage = (counts[idx] / total_pixels) * 100
-        hex_code = rgb_to_hex(rgb)
+    for idx, count in counts.items():
+        rgb = centers[idx].astype(int)
         colors.append({
-            'hex': hex_code,
-            'rgb': tuple(rgb.astype(int)),
-            'percentage': round(percentage, 2)
+            "rgb": tuple([int(c) for c in rgb]),  # Convert to standard int list then tuple
+            "hex": rgb_to_hex(rgb),
+            "percent": float(round(count / total * 100, 2)), # Cast to float
+            "luminance": float(relative_luminance(rgb)) # Cast to float
         })
 
-    return colors
+    return sorted(colors, key=lambda x: x["percent"], reverse=True)
 
 
-def mouse_callback_color_picker(image_path):
-    """
-    Interactive color picker - click on image to get color at that point
-    """
+# -------------------------
+# Global image palette
+# -------------------------
+
+def extract_global_colors(img_rgb, k=8):
+    pixels = img_rgb.reshape(-1, 3)
+    return cluster_colors(pixels, k)
+
+
+# -------------------------
+# Text-adjacent background pixels
+# -------------------------
+
+def extract_adjacent_text_pixels(img_rgb, bbox, padding=6):
+    h_img, w_img, _ = img_rgb.shape
+    xs = [p[0] for p in bbox]
+    ys = [p[1] for p in bbox]
+
+    x0 = max(min(xs) - padding, 0)
+    y0 = max(min(ys) - padding, 0)
+    x1 = min(max(xs) + padding, w_img)
+    y1 = min(max(ys) + padding, h_img)
+
+    region = img_rgb[y0:y1, x0:x1].copy()
+
+    mask = np.ones(region.shape[:2], dtype=bool)
+
+    tx0, ty0 = min(xs) - x0, min(ys) - y0
+    tx1, ty1 = max(xs) - x0, max(ys) - y0
+
+    mask[ty0:ty1, tx0:tx1] = False
+
+    return region[mask]
+
+
+# -------------------------
+# Text color extraction
+# -------------------------
+
+def extract_text_color(img_rgb, bbox):
+    xs = [p[0] for p in bbox]
+    ys = [p[1] for p in bbox]
+
+    crop = img_rgb[min(ys):max(ys), min(xs):max(xs)]
+    pixels = crop.reshape(-1, 3)
+
+    clusters = cluster_colors(pixels, k=2)
+
+    # Pick the brightest cluster (white text)
+    return max(clusters, key=lambda c: c["luminance"])
+
+
+
+# -------------------------
+# MAIN
+# -------------------------
+
+if __name__ == "__main__":
+    image_path = "/home/meghana/Downloads/bc_asset1.jpg"
+
     img = cv2.imread(image_path)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    def pick_color(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            # Get the color at clicked position
-            bgr = img[y, x]
-            rgb = img_rgb[y, x]
-            hex_code = rgb_to_hex(rgb)
+    reader = easyocr.Reader(['en'], gpu=False)
+    detections = reader.readtext(image_path)
 
-            print(f"\nColor at position ({x}, {y}):")
-            print(f"RGB: {tuple(rgb)}")
-            print(f"HEX: {hex_code}")
+    print("\n==============================")
+    print("GLOBAL IMAGE COLORS")
+    print("==============================")
+    global_colors = extract_global_colors(img_rgb)
+    for c in global_colors:
+        print(c["hex"], c["percent"], "%")
 
-            # Create a small window showing the picked color
-            color_display = np.zeros((100, 200, 3), dtype=np.uint8)
-            color_display[:] = bgr
-            cv2.putText(color_display, hex_code, (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.imshow('Picked Color', color_display)
+    for bbox, text, conf in detections:
+        bbox = [[int(p[0]), int(p[1])] for p in bbox]
 
-    cv2.namedWindow('Image - Click to pick color')
-    cv2.setMouseCallback('Image - Click to pick color', pick_color)
+        print("\n==============================")
+        print(f'TEXT: "{text}"')
+        print("==============================")
 
-    cv2.imshow('Image - Click to pick color', img)
-    print("\nClick on the image to pick colors. Press 'q' to quit.")
+        # TEXT COLOR
+        fg = extract_text_color(img_rgb, bbox)
+        print("Text color (FG):")
+        print(f"  {fg['hex']}  luminance={round(fg['luminance'],3)}")
 
-    while True:
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # BACKGROUND COLORS
+        bg_pixels = extract_adjacent_text_pixels(img_rgb, bbox)
+        bg_colors = cluster_colors(bg_pixels, k=3)
 
-    cv2.destroyAllWindows()
-
-
-def create_color_palette(colors, width=600, height=100):
-    """
-    Create a visual palette showing the extracted colors
-    """
-    palette = np.zeros((height, width, 3), dtype=np.uint8)
-
-    start_x = 0
-    for color in colors:
-        # Calculate width for this color based on percentage
-        color_width = int(width * (color['percentage'] / 100))
-
-        # BGR for OpenCV
-        bgr = color['rgb'][::-1]
-
-        # Fill the section
-        palette[:, start_x:start_x + color_width] = bgr
-
-        start_x += color_width
-
-    return palette
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example 1: Extract dominant colors
-    print("=== Example 1: Extract Dominant Colors ===")
-    print("Replace 'your_image.jpg' with your actual image path\n")
-
-    # Uncomment and modify the path below to use with your image
-    image_path = "/home/meghana/Downloads/bc_asset1.jpg"
-    colors = get_dominant_colors(image_path, num_colors=8)
-
-    print(f"Top {len(colors)} dominant colors:")
-    for i, color in enumerate(colors, 1):
-        print(f"{i}. HEX: {color['hex']} | RGB: {color['rgb']} | {color['percentage']}%")
-
-    # Create and display color palette
-    palette = create_color_palette(colors)
-    cv2.imshow('Color Palette', palette)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-
-    # Example 2: Interactive color picker
-    print("\n=== Example 2: Interactive Color Picker ===")
-    print("Uncomment the lines below and provide your image path\n")
-
-    # Uncomment to use interactive picker
-    # mouse_callback_color_picker("your_image.jpg")
-
-    print("\nTo use this script:")
-    print("1. Uncomment the relevant section")
-    print("2. Replace 'your_image.jpg' with your image file path")
-    print("3. Run the script")
+        print("Text-adjacent background colors:")
+        for bg in bg_colors:
+            print(f"  {bg['hex']}  luminance={round(bg['luminance'],3)}")

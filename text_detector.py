@@ -19,6 +19,13 @@ except ImportError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     import contrast_analyzer
 
+# Import color_picker
+try:
+    import color_picker
+except ImportError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    import color_picker
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -30,12 +37,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def detect_text_boxes(image_path: str):
+    """
+    Lightweight helper for other modules (contrast, color picker).
+    Returns text bounding boxes as (x, y, w, h).
+    """
+    reader = easyocr.Reader(['en'], gpu=False)
+    detections = reader.readtext(image_path)
+
+    boxes = []
+    for bbox, text, conf in detections:
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+
+        x_min, x_max = int(min(xs)), int(max(xs))
+        y_min, y_max = int(min(ys)), int(max(ys))
+
+        w = x_max - x_min
+        h = y_max - y_min
+
+        if w > 0 and h > 0:
+            boxes.append((x_min, y_min, w, h))
+
+    return boxes
+
+
 class DetailedDetection(BaseModel):
     """Detailed information about a single detected text region"""
     text: str
     confidence: float
     bbox: List[List[int]]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
     contrast_info: Optional[Dict[str, Any]] = None
+    color_info: Optional[Dict[str, Any]] = None  # New field for color palette
     wcag_violations: List[str] = Field(default_factory=list)
 
 class TextDetectionResult(BaseModel):
@@ -140,8 +173,47 @@ class ImageTextDetector:
                 for bbox, text, conf in detections:
                     clean_bbox = [[int(p[0]), int(p[1])] for p in bbox]
                     
-                    # Contrast Analysis
+                    # Contrast Analysis (existing)
                     contrast_info = contrast_analyzer.analyze_text_region(img, clean_bbox) if 'contrast_analyzer' in sys.modules else None
+
+                    # Color Picker Integration (new)
+                    color_info = None
+                    if 'color_picker' in sys.modules:
+                        try:
+                            # Extract text color
+                            fg_color = color_picker.extract_text_color(img, clean_bbox)
+                            
+                            # Extract background colors (palette)
+                            bg_pixels = color_picker.extract_adjacent_text_pixels(img, clean_bbox)
+                            bg_colors = color_picker.cluster_colors(bg_pixels, k=3)
+                            
+                            color_info = {
+                                "foreground": fg_color,
+                                "background_palette": bg_colors,
+                                "contrast_checks": []
+                            }
+                            
+                            # Perform contrast checks against palette
+                            fg_lum = fg_color['luminance']
+                            for bg in bg_colors:
+                                bg_lum = bg['luminance']
+                                l1 = max(fg_lum, bg_lum)
+                                l2 = min(fg_lum, bg_lum)
+                                ratio = (l1 + 0.05) / (l2 + 0.05)
+                                
+                                compliance = contrast_analyzer.check_wcag_compliance(ratio)
+                                
+                                color_info["contrast_checks"].append({
+                                    "bg_color": bg,
+                                    "ratio": round(ratio, 2),
+                                    "compliance": compliance
+                                })
+                                
+                                if not compliance['AA_normal']:
+                                    violations.append(f"Fails AA Normal vs BG {bg['hex']}")
+
+                        except Exception as cp_err:
+                            logger.warning(f"Color picker failed for region: {cp_err}")
                     
                     violations = []
                     if contrast_info and not contrast_info.get('error'):
@@ -159,6 +231,7 @@ class ImageTextDetector:
                         confidence=float(conf),
                         bbox=clean_bbox,
                         contrast_info=contrast_info,
+                        color_info=color_info,
                         wcag_violations=violations
                     ))
 
@@ -298,6 +371,42 @@ class ImageTextDetector:
                             else:
                                 f.write(f"| {text_snippet} | Error | N/A | N/A | ❌ Error |\n")
                     f.write("\n---\n\n")
+
+            # Add Color Analysis Section if available
+            f.write("## Color Palette Analysis\n\n")
+            for result in self.results:
+                # Check if this image has any detections with color info
+                if result.has_text and any(d.color_info for d in result.detections):
+                     f.write(f"### Image: `{result.filename}`\n")
+                     f.write(f"**Path**: `{result.original_path}`\n\n")
+                     
+                     for i, det in enumerate(result.detections, 1):
+                        if det.color_info:
+                            text_snippet = det.text.replace("\n", " ")[:30]
+                            # Clean up snippet
+                            if len(det.text) > 30: text_snippet += "..."
+                            
+                            f.write(f"#### {i}. Text: \"{text_snippet}\"\n")
+                            
+                            fg = det.color_info.get("foreground", {})
+                            f.write(f"- **Detected Text Color**: {fg.get('hex', 'N/A')} (Lum: {fg.get('luminance', 'N/A')})\n\n")
+                            
+                            f.write("| Background | Ratio | AA Normal | AA Large | AAA Normal | AAA Large |\n")
+                            f.write("|---|---|---|---|---|---|\n")
+                            
+                            for check in det.color_info.get("contrast_checks", []):
+                                bg = check['bg_color']
+                                ratio = check['ratio']
+                                comp = check['compliance']
+                                
+                                aa = "✅" if comp['AA_normal'] else "❌"
+                                aa_lg = "✅" if comp['AA_large'] else "❌"
+                                aaa = "✅" if comp['AAA_normal'] else "❌"
+                                aaa_lg = "✅" if comp['AAA_large'] else "❌"
+                                
+                                f.write(f"| {bg['hex']} | {ratio}:1 | {aa} | {aa_lg} | {aaa} | {aaa_lg} |\n")
+                            f.write("\n")
+                     f.write("---\n\n")
 
 def main():
     if len(sys.argv) > 1:

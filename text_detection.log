@@ -54,3 +54,5 @@
 2026-01-30 12:20:51,875 - text_detector - INFO - Initializing EasyOCR Reader (loading models)...
 2026-01-30 12:20:51,875 - easyocr.easyocr - WARNING - Using CPU. Note: This module is much faster with a GPU.
 2026-01-30 12:20:53,725 - text_detector - INFO - EasyOCR Reader initialized
+2026-02-06 12:34:25,048 - easyocr.easyocr - WARNING - Using CPU. Note: This module is much faster with a GPU.
+2026-02-06 12:35:46,866 - easyocr.easyocr - WARNING - Using CPU. Note: This module is much faster with a GPU.
