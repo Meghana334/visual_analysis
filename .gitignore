@@ -1,13 +1,8 @@
 .env
 crawled_images
 
-# Logs
 logs/
-*.log
-
-# Python cache
-__pycache__/
-*.py[cod]
+**/__pycache__/
 
 # Virtual environments
 .venv/
