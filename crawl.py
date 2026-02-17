@@ -140,13 +140,17 @@ class AsyncImageCrawler:
 
     async def _download_file(self, session: aiohttp.ClientSession, url: str, dest_path: str) -> bool:
         """Download a single file to destination path."""
+        count = 0
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status != 200:
                     logger.warning(f"Failed to download {url}: status {response.status}")
                     return False
+                count += 1
                 content = await response.read()
                 with open(dest_path, 'wb') as f:
+                    logger.info(f"Writing image from {url} to {dest_path} Image {count}")
+                    print(f"Writing image from {url} to {dest_path} Image {count}")
                     f.write(content)
                 return True
         except Exception as e:
@@ -506,6 +510,8 @@ class AsyncImageCrawler:
         logger.debug("Image is not a button image")
         return False
 
+
+
     async def classify_image(self, img_element, page) -> ImageClassification:
         """Classify image based on its attributes and context"""
         logger.info("Starting image classification")
@@ -692,16 +698,16 @@ class AsyncImageCrawler:
 
             let current = img.parentElement;
             const imgRect = img.getBoundingClientRect();
-            
+
             // Traverse up max 3 levels to find a container
             for (let i = 0; i < 3; i++) {
                 if (!current || current.tagName === 'BODY' || current.tagName === 'HTML') break;
-                
+
                 const rect = current.getBoundingClientRect();
-                
+
                 // Heuristic: Container shouldn't be vastly larger than image (e.g. < 4x area)
                 const areaRatio = (rect.width * rect.height) / (imgRect.width * imgRect.height);
-                
+
                 if (areaRatio > 4) {
                     break; 
                 }
@@ -710,32 +716,31 @@ class AsyncImageCrawler:
                 const children = Array.from(current.children);
                 const hasOverlaySibling = children.some(child => {
                     if (child === img) return false;
-                    
+
                     const childStyle = window.getComputedStyle(child);
                     const childRect = child.getBoundingClientRect();
-                    
+
                     // Check intersection with image
                     const intersect = !(childRect.right < imgRect.left || 
                                       childRect.left > imgRect.right || 
                                       childRect.bottom < imgRect.top || 
                                       childRect.top > imgRect.bottom);
-                    
+
                     const hasText = getVisibleText(child);
                     const isAbsolute = childStyle.position === 'absolute';
-                    
+
                     return (isAbsolute || intersect) && hasText;
                 });
 
                 if (hasOverlaySibling) {
                     return current;
                 }
-                
+
                 current = current.parentElement;
             }
-            
+
             return img;
         }''')
-
 
     async def crawl_page(self, url: str, max_depth: int = 2, current_depth: int = 0):
         """Crawl a single page and extract images"""
@@ -918,8 +923,9 @@ class AsyncImageCrawler:
                             container = await self.get_visual_container(img, page)
                             # Check if container is different from img (by comparing tag name or handle)
                             # Simple check: evaluate if they are the same node
-                            is_overlay_container = await page.evaluate('(args) => args[0] !== args[1]', [container, img])
-                            
+                            is_overlay_container = await page.evaluate('(args) => args[0] !== args[1]',
+                                                                       [container, img])
+
                             if is_overlay_container:
                                 logger.info("Overlay container detected! Will screenshot container instead of image.")
                                 print("    Overlay container detected")
@@ -940,7 +946,7 @@ class AsyncImageCrawler:
                                 # Update target element for screenshot
                                 target_element = container if is_overlay_container else img
                                 reason = "overlay container" if is_overlay_container else "text image/logo"
-                                
+
                                 logger.debug(
                                     f"Taking screenshot of {reason} to {screenshot_path}")
                                 await target_element.screenshot(path=screenshot_path)
@@ -966,7 +972,7 @@ class AsyncImageCrawler:
                                         print(f"  ✓ Downloaded: {filename}")
                                     else:
                                         logger.warning(f"Failed to download {absolute_src}, fallback/skipping")
-                                        print(f"  ✗ Failed to download: {filename}")
+                                        print(f"  ✗ Failed to load: {filename}")
                                         continue  # Skip if download failed
 
                             # Print classification details
@@ -1248,7 +1254,7 @@ async def main():
     logger.info("=" * 60)
 
     # Configuration
-    website_url = "https://www.kao.com/global/en/"
+    website_url = "https://www.bluecaffeine.com/"
     output_directory = "crawled_images"
     max_crawl_depth = 0  # 0 = single page, 1 = page + linked pages, etc.
 

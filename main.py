@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file (if needed for other things)
 load_dotenv()
 
-from crawl import AsyncImageCrawler
+from crawl.crawler import AsyncImageCrawler
 from text_detector import ImageTextDetector
 
 
