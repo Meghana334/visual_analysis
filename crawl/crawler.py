@@ -1,9 +1,7 @@
 import os
 import json
 import csv
-import hashlib
 import asyncio
-import base64
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 from pathlib import Path
@@ -14,6 +12,9 @@ from datetime import datetime
 import logging
 import sys
 import aiohttp
+from crawl.models import ImageData
+from image_processing.classify_assets import ClassifyAssets, ImageClassification
+
 
 # Configure logging
 logging.basicConfig(
@@ -70,14 +71,37 @@ class CrawlReport(BaseModel):
     sub_type_breakdown: dict[str, int] = Field(default_factory=dict)
     images: List[ImageData] = Field(default_factory=list)
 
+class _ClassificationResult:
+    """Adapter to convert classify_image dict to attribute-style access"""
+    def __init__(self, d: dict):
+        self.type = d["classification"]
+        self.sub_type = d.get("sub_type")
+        self.is_text_image = d.get("is_text_image", False)
+        self.is_functional = d.get("is_functional", False)
+        self.is_decorative = d.get("is_decorative", False)
+        self.is_complex = d.get("is_complex", False)
+        self.is_logo = d.get("is_logo", False)
+        self.is_icon = d.get("is_icon", False)
+        self.is_button = d.get("is_button", False)
+        self.file_format = d.get("file_format")
+
 
 class AsyncImageCrawler:
     def __init__(self, base_url: str, output_dir: str = "crawled_images",
                  include_data_uris: bool = False,
                  include_invisible: bool = False):
         logger.info(f"Initializing AsyncImageCrawler with base_url={base_url}")
+        domain = urlparse(base_url).netloc.replace('www.', '').replace('.', '_')
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        self.output_dir = f"{output_dir}/{domain}_{timestamp}"
+
         logger.debug(
-            f"output_dir={output_dir}, include_data_uris={include_data_uris}, include_invisible={include_invisible}")
+            f"output_dir={self.output_dir}, include_data_uris={include_data_uris}, include_invisible={include_invisible}")
+        logger.debug(f"Extracted domain: {domain}")
+        logger.debug(f"Generated timestamp: {timestamp}")
+        logger.info(f"Output directory will be: {self.output_dir}")
+
+        self.classifier = ClassifyAssets(output_dir=self.output_dir)
 
         self.base_url = base_url
         logger.debug(f"Set self.base_url to {base_url}")
@@ -87,17 +111,6 @@ class AsyncImageCrawler:
 
         self.include_invisible = include_invisible
         logger.debug(f"Set self.include_invisible to {include_invisible}")
-
-        # Create unique output directory based on domain
-        logger.info("Creating unique output directory based on domain")
-        domain = urlparse(base_url).netloc.replace('www.', '').replace('.', '_')
-        logger.debug(f"Extracted domain: {domain}")
-
-        timestamp = time.strftime('%Y%m%d_%H%M%S')
-        logger.debug(f"Generated timestamp: {timestamp}")
-
-        self.output_dir = f"{output_dir}/{domain}_{timestamp}"
-        logger.info(f"Output directory will be: {self.output_dir}")
 
         self.images_data: List[ImageData] = []
         logger.debug("Initialized empty images_data list")
@@ -188,6 +201,142 @@ class AsyncImageCrawler:
         logger.info("Lazy loading trigger complete")
 
         print(f"  ✓ Lazy loading complete")
+
+    def save_results(self):
+        """Save results to JSON file using Pydantic models"""
+        logger.info("Starting save_results")
+        output_file = f"{self.output_dir}/images_report.json"
+        logger.debug(f"Output file: {output_file}")
+
+        # --- Create summary ---
+        logger.info("Creating crawl summary")
+        summary = CrawlSummary(
+            total_images=len(self.images_data),
+            informative=sum(1 for img in self.images_data if img.classification == 'informative'),
+            decorative=sum(1 for img in self.images_data if img.classification == 'decorative'),
+            functional=sum(1 for img in self.images_data if img.classification == 'functional'),
+            complex=sum(1 for img in self.images_data if img.classification == 'complex'),
+            text_images=sum(1 for img in self.images_data if img.is_text_image),
+            functional_buttons=sum(
+                1 for img in self.images_data
+                if img.classification == 'functional' and img.sub_type == 'buttons'
+            ),
+            functional_icons=sum(
+                1 for img in self.images_data
+                if img.classification == 'functional' and img.sub_type == 'icons'
+            ),
+            functional_logos=sum(
+                1 for img in self.images_data
+                if img.classification == 'functional' and img.sub_type == 'logos'
+            ),
+            functional_images=sum(
+                1 for img in self.images_data
+                if img.classification == 'functional' and img.sub_type == 'images'
+            ),
+            pages_crawled=len(self.visited_urls)
+        )
+        logger.debug(f"Summary: {summary}")
+
+        # --- Sub-type breakdown ---
+        logger.info("Creating sub-type breakdown")
+        sub_type_breakdown: dict[str, int] = {}
+        for img in self.images_data:
+            if img.sub_type:
+                sub_type_breakdown[img.sub_type] = sub_type_breakdown.get(img.sub_type, 0) + 1
+        logger.debug(f"Sub-type breakdown: {sub_type_breakdown}")
+
+        # --- Final report ---
+        logger.info("Creating final crawl report")
+        report = CrawlReport(
+            base_url=self.base_url,
+            crawl_date=datetime.utcnow().isoformat(),
+            summary=summary,
+            sub_type_breakdown=sub_type_breakdown,
+            images=self.images_data
+        )
+
+        # --- Write JSON ---
+        logger.info(f"Writing report to {output_file}")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
+        logger.info(f"✓ Report saved successfully to {output_file}")
+
+        print("\n" + "=" * 60)
+        print("CRAWL COMPLETE ✅")
+        print(f"Images captured: {summary.total_images}")
+        print(f"Pages crawled: {summary.pages_crawled}")
+        print(f"Report saved to: {output_file}")
+        print(f"Debug log saved to: crawler_debug.log")
+        print("=" * 60)
+
+        # Export images with alt text to CSV
+        logger.info("Exporting images with alt text to CSV")
+        self.export_alt_text_csv()
+
+    def export_alt_text_csv(self):
+        """Export images with alt text to a CSV file"""
+        logger.info("Starting export_alt_text_csv")
+        csv_file = f"{self.output_dir}/images_with_alt_text.csv"
+        logger.debug(f"CSV output file: {csv_file}")
+
+        # Export images with alt text to CSV
+        images_to_export = [img for img in self.images_data if img.alt_text and img.alt_text.strip()]
+        logger.info(f"Preparing to export {len(images_to_export)} images to CSV")
+
+        if len(images_to_export) == 0:
+            logger.warning("No images found, skipping CSV export")
+            print("⚠ No images found")
+            return
+
+        # Define CSV headers
+        headers = [
+            'Image Filename',
+            'Image URL',
+            'Image Path',
+            'Alt Text',
+            'Title',
+            'Classification',
+            'Sub Type',
+            'Is Logo',
+            'Is Icon',
+            'Is Button',
+            'Is Functional',
+            'Is Decorative',
+            'Is Text Image',
+            'File Format'
+        ]
+
+        # Write CSV
+        logger.info(f"Writing CSV to {csv_file}")
+        try:
+            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+
+                for img in images_to_export:
+                    writer.writerow({
+                        'Image Filename': img.filename,
+                        'Image URL': img.url,
+                        'Image Path': img.screenshot_path,
+                        'Alt Text': img.alt_text,
+                        'Title': img.title,
+                        'Classification': img.classification,
+                        'Sub Type': img.sub_type or '',
+                        'Is Logo': 'Yes' if img.is_logo else 'No',
+                        'Is Icon': 'Yes' if img.is_icon else 'No',
+                        'Is Button': 'Yes' if img.is_button else 'No',
+                        'Is Functional': 'Yes' if img.is_functional else 'No',
+                        'Is Decorative': 'Yes' if img.is_decorative else 'No',
+                        'Is Text Image': 'Yes' if img.is_text_image else 'No',
+                        'File Format': img.file_format or 'N/A'
+                    })
+
+            logger.info(f"✓ CSV export successful: {csv_file}")
+            print(f"\n✓ Exported {len(images_to_export)} images to: {csv_file}")
+
+        except Exception as e:
+            logger.error(f"Error writing CSV: {str(e)}")
+            print(f"✗ Error exporting CSV: {str(e)}")
 
     async def reveal_hidden_images(self, page):
         """Click tabs, accordions, etc. to reveal hidden images"""
@@ -383,9 +532,13 @@ class AsyncImageCrawler:
                 await self.reveal_hidden_images(page)
 
                 # Wait for new images to load
+                # Wait for new images to load
                 logger.debug("Waiting 2000ms for newly revealed images")
                 await page.wait_for_timeout(2000)
                 logger.debug("Final wait complete")
+
+                # === GLOBAL ASSET EXTRACTION ===
+                # Removed per user request to use only Playwright and skip global assets
 
                 # Find all images
                 logger.info("Locating all <img> elements on page")
@@ -447,7 +600,6 @@ class AsyncImageCrawler:
                                 continue
                             else:
                                 logger.debug(f"Image {idx + 1} is a data URI - Including")
-                                data_uri_count += 1
 
                         # Make absolute URL
                         logger.debug("Converting to absolute URL")
@@ -459,11 +611,141 @@ class AsyncImageCrawler:
                         alt_text = await img.get_attribute('alt') or ''
                         title = await img.get_attribute('title') or ''
 
-                        # TODO: Add classification logic and saving here
-                        logger.debug(f"Image {idx + 1} processed: src={absolute_src[:50]}, alt={alt_text[:30]}")
+                        # Classify image
+                        print(f"\n  [{idx + 1}/{len(images)}] Analyzing image...")
+                        logger.info(f"Classifying image {idx + 1}")
+                        classification_dict = await self.classifier.classify_image(img)
+                        classification = _ClassificationResult(classification_dict)
+
+                        # Generate unique filename
+                        logger.debug("Generating filename")
+                        img_hash = self.classifier.get_image_hash(absolute_src)
+                        filename = f"img_{img_hash}.png"
+                        logger.debug(f"Filename: {filename}")
+
+                        # Determine directory based on classification
+                        logger.debug("Determining output directory based on classification")
+                        if classification.type == 'complex':
+                            logger.debug("Classification is 'complex' - SKIPPING per user request")
+                            continue
+
+                        if classification.type == 'functional':
+                            img_dir = f"{self.output_dir}/functional/{classification.sub_type}"
+                        elif classification.is_text_image and not classification.is_functional:
+                            img_dir = f"{self.output_dir}/text_images"
+                        else:
+                            img_dir = f"{self.output_dir}/{classification.type}"
+                        logger.debug(f"Output directory: {img_dir}")
+
+                        os.makedirs(img_dir, exist_ok=True)
+
+                        screenshot_path = f"{img_dir}/{filename}"
+                        logger.debug(f"Full screenshot path: {screenshot_path}")
+
+                        # === CHECK FOR OVERLAY CONTAINER ===
+                        logger.debug("Checking for overlay container")
+                        try:
+                            container = await self.classifier.get_visual_container(img, page)
+                            # Check if container is different from img (by comparing tag name or handle)
+                            # Simple check: evaluate if they are the same node
+                            is_overlay_container = await page.evaluate('(args) => args[0] !== args[1]',
+                                                                       [container, img])
+
+                            if is_overlay_container:
+                                logger.info("Overlay container detected! Will screenshot container instead of image.")
+                                print("    Overlay container detected")
+                        except Exception as e:
+                            logger.warning(f"Error checking for overlay container: {e}")
+                            is_overlay_container = False
+                            container = img
+
+                        # === SCREENSHOT FOR TEXT IMAGES, LOGOS, AND OVERLAYS ===
+                        try:
+                            # Determine if we should screenshot or download
+                            # Screenshot if:
+                            # 1. It's a text image or logo (legacy logic)
+                            # 2. It has an overlay container (new logic)
+                            should_screenshot = classification.is_text_image or classification.is_logo or is_overlay_container
+
+                            if should_screenshot:
+                                # Update target element for screenshot
+                                target_element = container if is_overlay_container else img
+                                reason = "overlay container" if is_overlay_container else "text image/logo"
+
+                                logger.debug(
+                                    f"Taking screenshot of {reason} to {screenshot_path}")
+                                await target_element.screenshot(path=screenshot_path)
+                                logger.info(f"✓ Screenshot taken: {screenshot_path}")
+                                print(f"  ✓ Screenshot saved ({reason}): {filename}")
+                            else:
+                                # Download original file for other images
+                                async with aiohttp.ClientSession() as session:
+                                    logger.debug(f"Downloading original image to {screenshot_path}")
+
+                                    # Fix extension if needed - we want the original file extension
+                                    original_ext = os.path.splitext(urlparse(absolute_src).path)[1]
+                                    if original_ext:
+                                        # Update filename (and screenshot_path) to match original extension
+                                        if not filename.endswith(original_ext):
+                                            filename = f"img_{img_hash}{original_ext}"
+                                            screenshot_path = f"{img_dir}/{filename}"
+
+                                    success = await self.classifier._download_file(session, absolute_src, screenshot_path)
+
+                                    if success:
+                                        logger.info(f"✓ Image downloaded: {screenshot_path}")
+                                        print(f"  ✓ Downloaded: {filename}")
+                                    else:
+                                        logger.warning(f"Failed to download {absolute_src}, fallback/skipping")
+                                        print(f"  ✗ Failed to load: {filename}")
+                                        continue  # Skip if download failed
+
+                            # Print classification details
+                            print(f"    Type: {classification.type}")
+                            if classification.sub_type:
+                                print(f"    Sub-type: {classification.sub_type}")
+                            if classification.is_logo:
+                                print(f"    Logo: Yes")
+                            if classification.is_icon:
+                                print(f"    Icon: Yes")
+                            if classification.is_button:
+                                print(f"    Button Image: Yes")
+                            if alt_text:
+                                print(f"    Alt text: {alt_text[:60]}{'...' if len(alt_text) > 60 else ''}")
+
+                        except Exception as e:
+                            logger.error(f"Failed to capture image {idx + 1}: {str(e)}")
+                            print(f"  ✗ Failed to capture {filename}: {str(e)}")
+                            continue
+
+                        # Store image data using Pydantic model
+                        logger.debug("Creating ImageData object")
+                        image_data = ImageData(
+                            url=url,
+                            src=absolute_src,
+                            alt_text=alt_text,
+                            title=title,
+                            classification=classification.type,
+                            sub_type=classification.sub_type,
+                            is_functional=classification.is_functional,
+                            is_decorative=classification.is_decorative,
+                            is_complex=classification.is_complex,
+                            is_text_image=classification.is_text_image,
+                            is_logo=classification.is_logo,
+                            is_icon=classification.is_icon,
+                            is_button=classification.is_button,
+                            file_format=classification.file_format,
+                            screenshot_path=screenshot_path,
+                            filename=filename
+                        )
+
+                        logger.debug("Adding image to images_data list")
+                        self.images_data.append(image_data)
+                        logger.info(f"✓ Successfully processed image {idx + 1}")
 
                     except Exception as e:
-                        logger.warning(f"Error processing image {idx + 1}: {str(e)}")
+                        logger.error(f"Error processing image {idx}: {str(e)}")
+                        print(f"  ✗ Error processing image {idx}: {str(e)}")
                         continue
 
                 # Print skip statistics

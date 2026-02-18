@@ -4,34 +4,21 @@ import shutil
 import sys
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 import easyocr
 import cv2
-import numpy as np
+from utils.color_picker import extract_color
+from utils.contrast import contrast_analyzer
 
-# Import our custom contrast analyzer
-try:
-    import contrast_analyzer
-except ImportError:
-    # If running from a different directory, try to append the current directory
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    import contrast_analyzer
-
-# Import color_picker
-try:
-    import color_picker
-except ImportError:
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    import color_picker
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('text_detection.log'),
+        logging.FileHandler('../text_detection.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -67,7 +54,7 @@ class DetailedDetection(BaseModel):
     """Detailed information about a single detected text region"""
     text: str
     confidence: float
-    bbox: List[List[int]]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    bbox: List[tuple[int, int]]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
     contrast_info: Optional[Dict[str, Any]] = None
     color_info: Optional[Dict[str, Any]] = None  # New field for color palette
     wcag_violations: List[str] = Field(default_factory=list)
@@ -157,7 +144,6 @@ class ImageTextDetector:
         logger.info(f"Processing: {image_path}")
 
         filename = Path(image_path).name
-        # Determine category based on source path (folder structure from crawl.py)
         category = self._determine_category(image_path)
 
         result = TextDetectionResult(
@@ -175,22 +161,25 @@ class ImageTextDetector:
                 img = cv2.imread(image_path)
 
                 for bbox, text, conf in detections:
-                    clean_bbox = [[int(p[0]), int(p[1])] for p in bbox]
+                    clean_bbox = [(int(p[0]), int(p[1])) for p in bbox]
 
-                    # Contrast Analysis (existing)
-                    contrast_info = contrast_analyzer.analyze_text_region(img,
-                                                                          clean_bbox) if 'contrast_analyzer' in sys.modules else None
+                    # contrast_info = contrast_analyzer.analyze_text_region(img,
+                    #                                                       clean_bbox) if 'contrast_analyzer' in sys.modules else None
 
-                    # Color Picker Integration (new)
+                    try:
+                        contrast_info = contrast_analyzer.analyze_text_region(img, clean_bbox)
+                    except Exception as e:
+                        logger.warning(f"Contrast analysis failed: {e}")
+                        contrast_info = None
+
+                    violations = []
+
                     color_info = None
-                    if 'color_picker' in sys.modules:
+                    if 'utils.color_picker' in sys.modules:
                         try:
-                            # Extract text color
-                            fg_color = color_picker.extract_text_color(img, clean_bbox)
-
-                            # Extract background colors (palette)
-                            bg_pixels = color_picker.extract_adjacent_text_pixels(img, clean_bbox)
-                            bg_colors = color_picker.cluster_colors(bg_pixels, k=3)
+                            fg_color = extract_color.extract_text_color(img, clean_bbox)
+                            bg_pixels = extract_color.extract_adjacent_text_pixels(img, clean_bbox)
+                            bg_colors = extract_color.cluster_colors(bg_pixels, k=3)
 
                             color_info = {
                                 "foreground": fg_color,
@@ -198,31 +187,25 @@ class ImageTextDetector:
                                 "contrast_checks": []
                             }
 
-                            # Perform contrast checks against palette
                             fg_lum = fg_color['luminance']
                             for bg in bg_colors:
                                 bg_lum = bg['luminance']
                                 l1 = max(fg_lum, bg_lum)
                                 l2 = min(fg_lum, bg_lum)
                                 ratio = (l1 + 0.05) / (l2 + 0.05)
-
                                 compliance = contrast_analyzer.check_wcag_compliance(ratio)
-
                                 color_info["contrast_checks"].append({
                                     "bg_color": bg,
                                     "ratio": round(ratio, 2),
                                     "compliance": compliance
                                 })
-
                                 if not compliance['AA_normal']:
-                                    violations.append(f"Fails AA Normal vs BG {bg['hex']}")
+                                    violations.append(f"Fails AA Normal vs BG {bg['hex']}")  # ✅ safe now
 
                         except Exception as cp_err:
                             logger.warning(f"Color picker failed for region: {cp_err}")
 
-                    violations = []
                     if contrast_info and not contrast_info.get('error'):
-                        # Check compliance keys
                         if 'compliance' in contrast_info:
                             compliance = contrast_info['compliance']
                             if not compliance.get('AA_normal', False):

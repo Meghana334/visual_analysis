@@ -5,7 +5,6 @@ Combines web image crawling with EasyOCR for text detection and WCAG contrast an
 """
 
 import asyncio
-import os
 import sys
 import argparse
 from dotenv import load_dotenv
@@ -14,7 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from crawl.crawler import AsyncImageCrawler
-from text_detector import ImageTextDetector
+from ocr.text_detector import ImageTextDetector
+
 
 
 async def run_crawler(url: str, max_depth: int = 0):
@@ -41,16 +41,14 @@ def run_text_detector(source_dir: str):
     print("STEP 2: TEXT DETECTION & CONTRAST ANALYSIS (EasyOCR)")
     print("=" * 60 + "\n")
 
-    # Text detection will create output inside source_dir/text_detected
     detector = ImageTextDetector(
         source_directory=source_dir
-        # output_directory will default to source_dir/text_detected
     )
 
     # Scan directory
     detector.scan_directory()
     detector.save_reports()
-    return detector.text_detected_dir  # Return the actual output directory path
+    return detector.text_detected_dir
 
 
 async def main():
