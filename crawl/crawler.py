@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import hashlib
 import asyncio
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
@@ -42,6 +43,7 @@ class ImageData(BaseModel):
     is_text_image: bool = False
     is_logo: bool = False
     is_icon: bool = False
+    is_chart: bool = False
     is_button: bool = False
     file_format: Optional[str] = None
     screenshot_path: str
@@ -137,7 +139,9 @@ class AsyncImageCrawler:
             f"{self.output_dir}/functional/icons",
             f"{self.output_dir}/functional/logos",
             f"{self.output_dir}/functional/images",
-            f"{self.output_dir}/text_images",
+            f"{self.output_dir}/complex",
+            f"{self.output_dir}/complex/charts",
+            f"{self.output_dir}/complex/emojis"
         ]
         logger.debug(f"Directory list prepared: {len(directories)} directories")
 
@@ -434,29 +438,31 @@ class AsyncImageCrawler:
         """More comprehensive visibility check"""
         logger.debug("Checking element visibility")
         try:
-            # Check if element is in viewport and has dimensions
-            logger.debug("Evaluating element visibility properties")
             visibility = await element.evaluate('''el => {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
-
+                const tag = el.tagName.toLowerCase();
+                // Only require src for <img> elements
+                const srcOk = tag !== 'img' || !!(
+                    el.src || el.getAttribute('data-src') || el.getAttribute('data-lazy-src')
+                );
                 return {
                     hasSize: rect.width > 0 && rect.height > 0,
                     isDisplayed: style.display !== 'none',
                     isVisible: style.visibility !== 'hidden',
                     hasOpacity: parseFloat(style.opacity) > 0,
-                    src: el.src || el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || '',
+                    srcOk: srcOk,
                 };
             }''')
             logger.debug(f"Visibility check result: {visibility}")
 
-            # Image must meet all conditions
-            is_visible = (visibility['hasSize'] and
-                          visibility['isDisplayed'] and
-                          visibility['isVisible'] and
-                          visibility['hasOpacity'] and
-                          visibility['src'])  # Must have source
-
+            is_visible = (
+                    visibility['hasSize'] and
+                    visibility['isDisplayed'] and
+                    visibility['isVisible'] and
+                    visibility['hasOpacity'] and
+                    visibility['srcOk']
+            )
             logger.debug(f"Element visibility final result: {is_visible}")
             return is_visible
 
@@ -625,18 +631,17 @@ class AsyncImageCrawler:
 
                         # Determine directory based on classification
                         logger.debug("Determining output directory based on classification")
-                        if classification.type == 'complex':
-                            logger.debug("Classification is 'complex' - SKIPPING per user request")
-                            continue
 
-                        if classification.type == 'functional':
-                            img_dir = f"{self.output_dir}/functional/{classification.sub_type}"
+                        if classification.type == 'complex':
+                            img_dir = f"{self.output_dir}/complex/{classification.sub_type or 'charts'}"
+                        elif classification.type == 'functional':
+                            img_dir = f"{self.output_dir}/functional/{classification.sub_type or 'images'}"
                         elif classification.is_text_image and not classification.is_functional:
                             img_dir = f"{self.output_dir}/text_images"
                         else:
                             img_dir = f"{self.output_dir}/{classification.type}"
-                        logger.debug(f"Output directory: {img_dir}")
 
+                        logger.debug(f"Output directory: {img_dir}")
                         os.makedirs(img_dir, exist_ok=True)
 
                         screenshot_path = f"{img_dir}/{filename}"
@@ -644,61 +649,123 @@ class AsyncImageCrawler:
 
                         # === CHECK FOR OVERLAY CONTAINER ===
                         logger.debug("Checking for overlay container")
-                        try:
-                            container = await self.classifier.get_visual_container(img, page)
-                            # Check if container is different from img (by comparing tag name or handle)
-                            # Simple check: evaluate if they are the same node
-                            is_overlay_container = await page.evaluate('(args) => args[0] !== args[1]',
-                                                                       [container, img])
+                        is_overlay_container = False
+                        container = img  # default to img itself
 
+                        try:
+                            container_handle = await self.classifier.get_visual_container(img, page)
+                            is_overlay_container = await page.evaluate(
+                                '(args) => args[0] !== args[1]',
+                                [container_handle, img]
+                            )
                             if is_overlay_container:
-                                logger.info("Overlay container detected! Will screenshot container instead of image.")
+                                container = container_handle
+                                logger.info("Overlay container detected — will screenshot container instead of image")
                                 print("    Overlay container detected")
                         except Exception as e:
                             logger.warning(f"Error checking for overlay container: {e}")
-                            is_overlay_container = False
-                            container = img
 
-                        # === SCREENSHOT FOR TEXT IMAGES, LOGOS, AND OVERLAYS ===
+                        # === SCREENSHOT vs DOWNLOAD DECISION ===
+                        # Priority order (icons/buttons checked BEFORE overlay):
+                        #   Icons         → always download original (screenshot = blank tiny PNG)
+                        #   Button-images → download original (<img> acting as button)
+                        #   Logos         → screenshot (preserves brand context)
+                        #   Overlays      → screenshot container (only for plain images)
+                        #   Plain         → download original file
+
                         try:
-                            # Determine if we should screenshot or download
-                            # Screenshot if:
-                            # 1. It's a text image or logo (legacy logic)
-                            # 2. It has an overlay container (new logic)
-                            should_screenshot = classification.is_text_image or classification.is_logo or is_overlay_container
+                            if classification.is_icon:
+                                # ── ICON: download original first — MUST be checked before overlay ──
+                                # Icons are inside <a> links so is_overlay_container fires first otherwise.
+                                # element.screenshot() on a ~40px transparent icon → blank ~121B PNG.
+                                original_ext = os.path.splitext(urlparse(absolute_src).path)[1] or '.png'
+                                if not filename.endswith(original_ext):
+                                    filename = f"img_{img_hash}{original_ext}"
+                                    screenshot_path = f"{img_dir}/{filename}"
 
-                            if should_screenshot:
-                                # Update target element for screenshot
-                                target_element = container if is_overlay_container else img
-                                reason = "overlay container" if is_overlay_container else "text image/logo"
+                                async with aiohttp.ClientSession() as session:
+                                    downloaded = await self.classifier._download_file(
+                                        session, absolute_src, screenshot_path
+                                    )
 
-                                logger.debug(
-                                    f"Taking screenshot of {reason} to {screenshot_path}")
-                                await target_element.screenshot(path=screenshot_path)
-                                logger.info(f"✓ Screenshot taken: {screenshot_path}")
-                                print(f"  ✓ Screenshot saved ({reason}): {filename}")
+                                if downloaded:
+                                    logger.info(f"✓ Icon downloaded: {screenshot_path}")
+                                    print(f"  ✓ Downloaded icon: {filename}")
+                                else:
+                                    # Fallback: screenshot the nearest visible parent container
+                                    logger.warning(f"Icon download failed, falling back to parent screenshot")
+                                    screenshot_path = f"{img_dir}/img_{img_hash}.png"
+                                    filename = f"img_{img_hash}.png"
+                                    try:
+                                        parent_handle = await img.evaluate_handle(
+                                            'el => el.closest("a, button, li, td, div") || el.parentElement'
+                                        )
+                                        await parent_handle.screenshot(path=screenshot_path)
+                                        logger.info(f"✓ Parent screenshot taken: {screenshot_path}")
+                                        print(f"  ✓ Parent screenshot (icon fallback): {filename}")
+                                    except Exception as pe:
+                                        logger.error(f"Icon parent screenshot failed: {pe}")
+                                        continue
+
+                            elif classification.is_button:
+                                # ── BUTTON-as-IMAGE (<img> classified as button) → download original ──
+                                # The element is an <img> acting as a button; download preserves quality.
+                                original_ext = os.path.splitext(urlparse(absolute_src).path)[1] or '.png'
+                                if not filename.endswith(original_ext):
+                                    filename = f"img_{img_hash}{original_ext}"
+                                    screenshot_path = f"{img_dir}/{filename}"
+
+                                async with aiohttp.ClientSession() as session:
+                                    downloaded = await self.classifier._download_file(
+                                        session, absolute_src, screenshot_path
+                                    )
+
+                                if downloaded:
+                                    logger.info(f"✓ Button-image downloaded: {screenshot_path}")
+                                    print(f"  ✓ Downloaded button-image: {filename}")
+                                else:
+                                    # Fallback: screenshot the img itself
+                                    logger.warning(f"Button-image download failed, falling back to screenshot")
+                                    screenshot_path = f"{img_dir}/img_{img_hash}.png"
+                                    filename = f"img_{img_hash}.png"
+                                    await img.screenshot(path=screenshot_path)
+                                    logger.info(f"✓ Button-image screenshot (fallback): {screenshot_path}")
+                                    print(f"  ✓ Screenshot (button-image fallback): {filename}")
+
+                            elif classification.is_logo:
+                                # Screenshot logos in page context
+                                logger.debug(f"Taking screenshot (logo) to {screenshot_path}")
+                                await img.screenshot(path=screenshot_path)
+                                logger.info(f"✓ Screenshot taken (logo): {screenshot_path}")
+                                print(f"  ✓ Screenshot saved (logo): {filename}")
+
+                            elif is_overlay_container:
+                                # Plain image with overlay text → screenshot the container
+                                logger.debug(f"Taking screenshot (overlay container) to {screenshot_path}")
+                                await container.screenshot(path=screenshot_path)
+                                logger.info(f"✓ Screenshot taken (overlay): {screenshot_path}")
+                                print(f"  ✓ Screenshot saved (overlay container): {filename}")
+
                             else:
-                                # Download original file for other images
+                                # Plain image — download original file, preserve extension
+                                original_ext = os.path.splitext(urlparse(absolute_src).path)[1]
+                                if original_ext and not filename.endswith(original_ext):
+                                    filename = f"img_{img_hash}{original_ext}"
+                                    screenshot_path = f"{img_dir}/{filename}"
+
                                 async with aiohttp.ClientSession() as session:
                                     logger.debug(f"Downloading original image to {screenshot_path}")
+                                    success = await self.classifier._download_file(
+                                        session, absolute_src, screenshot_path
+                                    )
 
-                                    # Fix extension if needed - we want the original file extension
-                                    original_ext = os.path.splitext(urlparse(absolute_src).path)[1]
-                                    if original_ext:
-                                        # Update filename (and screenshot_path) to match original extension
-                                        if not filename.endswith(original_ext):
-                                            filename = f"img_{img_hash}{original_ext}"
-                                            screenshot_path = f"{img_dir}/{filename}"
-
-                                    success = await self.classifier._download_file(session, absolute_src, screenshot_path)
-
-                                    if success:
-                                        logger.info(f"✓ Image downloaded: {screenshot_path}")
-                                        print(f"  ✓ Downloaded: {filename}")
-                                    else:
-                                        logger.warning(f"Failed to download {absolute_src}, fallback/skipping")
-                                        print(f"  ✗ Failed to load: {filename}")
-                                        continue  # Skip if download failed
+                                if success:
+                                    logger.info(f"✓ Image downloaded: {screenshot_path}")
+                                    print(f"  ✓ Downloaded: {filename}")
+                                else:
+                                    logger.warning(f"Failed to download {absolute_src}, skipping")
+                                    print(f"  ✗ Failed to download: {filename}")
+                                    continue  # skip storing this image
 
                             # Print classification details
                             print(f"    Type: {classification.type}")
@@ -767,6 +834,115 @@ class AsyncImageCrawler:
 
                 logger.info(
                     f"Summary - Total: {len(images)}, Captured: {len([img for img in self.images_data if img.url == url])}, Skipped: {skipped_invisible + skipped_no_src + skipped_data_uri}")
+
+                # ═══════════════════════════════════════════════════════
+                # BUTTON EXTRACTION PASS
+                # The <img> loop above never sees <button>, <input type=submit>,
+                # or [role=button] elements. This pass captures them separately.
+                # ═══════════════════════════════════════════════════════
+                logger.info("Starting button extraction pass")
+                print(f"\n{'=' * 60}")
+                print("Extracting standalone button elements...")
+
+                btn_selector = (
+                    'button, '
+                    'input[type="button"], input[type="submit"], input[type="reset"], '
+                    '[role="button"]'
+                )
+                btn_elements = await page.locator(btn_selector).all()
+                logger.info(f"Found {len(btn_elements)} button elements")
+                print(f"✓ Found {len(btn_elements)} button elements")
+
+                btn_dir = f"{self.output_dir}/functional/buttons"
+                os.makedirs(btn_dir, exist_ok=True)
+                captured_btns = 0
+                seen_btn_hashes: set[str] = set()
+
+                for btn_idx, btn_el in enumerate(btn_elements):
+                    try:
+                        # Visibility check
+                        is_visible = await self.is_actually_visible(btn_el, page)
+                        if not is_visible:
+                            logger.debug(f"Button {btn_idx+1} not visible, skipping")
+                            continue
+
+                        # Get accessible text for identification
+                        btn_info = await btn_el.evaluate('''el => ({
+                            tag: el.tagName.toLowerCase(),
+                            text: (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().slice(0, 80),
+                            type: el.getAttribute("type") || "",
+                            cls:  (el.className || "").slice(0, 60)
+                        })''')
+
+                        # Deduplicate by outer-HTML hash
+                        btn_html = await btn_el.evaluate('el => el.outerHTML.slice(0, 200)')
+                        btn_hash = hashlib.md5(btn_html.encode()).hexdigest()[:12]
+                        if btn_hash in seen_btn_hashes:
+                            logger.debug(f"Button {btn_idx+1} duplicate, skipping")
+                            continue
+                        seen_btn_hashes.add(btn_hash)
+
+                        btn_filename = f"btn_{btn_hash}.png"
+                        btn_path = f"{btn_dir}/{btn_filename}"
+
+                        logger.debug(f"Screenshotting button {btn_idx+1}: {btn_info}")
+                        await btn_el.screenshot(path=btn_path)
+
+                        # Verify screenshot has real content:
+                        #   1. File must be > 200 bytes (rejects totally blank PNGs)
+                        #   2. Pixel dims must be >= 20x10 (rejects visually collapsed 10x11px buttons)
+                        file_size = os.path.getsize(btn_path)
+                        if file_size < 200:
+                            logger.warning(f"Button screenshot too small ({file_size}B), skipping")
+                            os.remove(btn_path)
+                            continue
+
+                        # Read PNG dimensions from header (no PIL required)
+                        try:
+                            import struct
+                            with open(btn_path, 'rb') as _f:
+                                _f.read(16)  # skip PNG sig + length + type
+                                _w = struct.unpack('>I', _f.read(4))[0]
+                                _h = struct.unpack('>I', _f.read(4))[0]
+                            if _w < 20 or _h < 10:
+                                logger.warning(f"Button too small ({_w}x{_h}px), skipping")
+                                os.remove(btn_path)
+                                continue
+                        except Exception:
+                            pass  # if we can't read dims, allow through
+
+                        captured_btns += 1
+                        btn_label = btn_info['text'] or f"<{btn_info['tag']}>"
+                        print(f"  ✓ Button captured: {btn_filename} — \"{btn_label}\"")
+                        logger.info(f"✓ Button screenshot: {btn_path} ({btn_label})")
+
+                        # Store in images_data
+                        image_data = ImageData(
+                            url=url,
+                            src=url,  # buttons have no src
+                            alt_text=btn_info['text'],
+                            title=btn_info['text'],
+                            classification='functional',
+                            sub_type='buttons',
+                            is_functional=True,
+                            is_decorative=False,
+                            is_complex=False,
+                            is_text_image=False,
+                            is_logo=False,
+                            is_icon=False,
+                            is_button=True,
+                            file_format='png',
+                            screenshot_path=btn_path,
+                            filename=btn_filename
+                        )
+                        self.images_data.append(image_data)
+
+                    except Exception as e:
+                        logger.debug(f"Failed to capture button {btn_idx+1}: {e}")
+                        continue
+
+                print(f"  Buttons captured: {captured_btns}/{len(btn_elements)}")
+                logger.info(f"Button extraction complete: {captured_btns} captured")
 
                 # Find links for crawling (optional)
                 if current_depth < max_depth:
