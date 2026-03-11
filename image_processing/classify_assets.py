@@ -4,10 +4,12 @@ import aiohttp
 import logging
 from urllib.parse import urljoin
 from pydantic import BaseModel
-
+from config.logger import setup_logger
 from crawl.models import ImageData
+import sys
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(name="KAC", tag="classify_assets")
+logger.info("Logger initialized")
 
 
 class ImageClassification(BaseModel):
@@ -61,9 +63,9 @@ class ClassifyAssets:
                     hasClickHandler: el.onclick !== null || el.parentElement?.onclick !== null
                 };
             }''')
-            logger.debug(f"Context info: {context_info}")
+            logger.info(f"Context info: {context_info}")
         except Exception as e:
-            logger.warning(f"Could not get context info: {str(e)}")
+            logger.info(f"Could not get context info: {str(e)}")
             context_info = {
                 'width': 0, 'height': 0,
                 'inLink': False, 'inButton': False, 'hasClickHandler': False
@@ -286,7 +288,7 @@ class ClassifyAssets:
         Returns True only when cumulative score >= threshold (avoids false positives).
         """
 
-        logger.debug(f"is_chart check: src={src[:60]}, alt={alt_text[:60]}")
+        logger.info(f"is_chart check: src={src[:60]}, alt={alt_text[:60]}")
 
         score = 0  # Accumulate evidence; threshold = 3
 
@@ -453,7 +455,7 @@ class ClassifyAssets:
                     score += 3  # Bumped from +2 — caption text is very reliable
 
         except Exception as e:
-            logger.debug(f"Parent context error: {e}")
+            logger.info(f"Parent context error: {e}")
 
         # ─────────────────────────────────────────────────────────────
         # 4. SVG STRUCTURAL ANALYSIS
@@ -534,7 +536,7 @@ class ClassifyAssets:
                     score += 1
 
         except Exception as e:
-            logger.debug(f"Size heuristic error: {e}")
+            logger.info(f"Size heuristic error: {e}")
 
         # ─────────────────────────────────────────────────────────────
         # 7. FILE FORMAT SIGNAL
@@ -555,7 +557,7 @@ class ClassifyAssets:
 
     async def is_button_image(self, element) -> bool:
         """Detect if element is a button or image inside a button"""
-        logger.debug("Checking if element is a button")
+        logger.info("Checking if element is a button")
         try:
             result = await element.evaluate('''el => {
                 const tag = el.tagName.toLowerCase();
@@ -615,7 +617,7 @@ class ClassifyAssets:
                 return { isButton: false, reason: null };
             }''')
 
-            logger.debug(f"Button detection result: {result}")
+            logger.info(f"Button detection result: {result}")
             if result.get('isButton'):
                 logger.info(f"Button detected: {result.get('reason')}")
                 return True
@@ -687,3 +689,9 @@ class ClassifyAssets:
         except Exception as e:
             logger.error(f"Download error {url}: {e}")
             return False
+
+
+
+
+
+

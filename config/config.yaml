@@ -1,0 +1,37 @@
+
+input :
+  url: "https://www.kao.com/global/en/"
+  max_depth: 0
+  output_dir: "crawled_images"
+
+directories:
+  - "informative"
+  - "decorative"
+  - "functional"
+  - "functional/buttons"
+  - "functional/icons"
+  - "functional/logos"
+  - "functional/images"
+  - "complex"
+  - "complex/charts"
+  - "complex/emojis"
+
+ocr:
+  base_folder: "text_detected"
+  contrast_folder: "contrast"
+
+  categories:
+    button_text: "button_text"
+    informational_text: "informational_text"
+    logo_text: "logo_text"
+    with_text: "with_text"
+
+crawler:
+  include_data_uris: false
+  include_invisible: false
+  scroll_passes: 3
+
+
+crawl_browser:
+  width : 1920
+  height': 1080

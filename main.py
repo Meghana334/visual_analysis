@@ -1,105 +1,111 @@
 #!/usr/bin/env python3
-"""
-Integrated Image Crawler and Text Detector (EasyOCR Version)
-Combines web image crawling with EasyOCR for text detection and WCAG contrast analysis
-"""
 
 import asyncio
 import sys
-import argparse
 from dotenv import load_dotenv
 
-# Load environment variables from .env file (if needed for other things)
 load_dotenv()
 
 from crawl.crawler import AsyncImageCrawler
-from ocr.text_detector import ImageTextDetector
+from ocr.text_detector import OCRPreprocessing, TextClassification
+from config.logger import setup_logger
+from utils.helper_modules.config_helper import load_config
+
+
+# Load config
+logger = setup_logger(name="KAC", tag="main")
+logger.info("Logger initialized")
+config = load_config()
+logger.info("Configuration loaded successfully")
 
 
 
 async def run_crawler(url: str, max_depth: int = 0):
-    """Run the async image crawler"""
-    print("\n" + "=" * 60)
-    print("STEP 1: WEB IMAGE CRAWLER")
-    print("=" * 60 + "\n")
+    logger.info("Starting crawler step")
+    logger.info(f"URL: {url}")
+    logger.info(f"Max depth: {max_depth}")
 
     crawler = AsyncImageCrawler(
         base_url=url,
-        output_dir="crawled_images",
-        include_data_uris=False,
-        include_invisible=False
+        max_depth=max_depth
     )
 
-    await crawler.crawl_page(url=url, max_depth=max_depth)
+    await crawler.crawl_page()
     crawler.save_results()
+    logger.info("Crawler step completed successfully")
     return crawler.output_dir
 
 
 def run_text_detector(source_dir: str):
-    """Run the EasyOCR text detector on crawled images"""
-    print("\n" + "=" * 60)
-    print("STEP 2: TEXT DETECTION & CONTRAST ANALYSIS (EasyOCR)")
-    print("=" * 60 + "\n")
 
-    detector = ImageTextDetector(
-        source_directory=source_dir
-    )
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 2: TEXT DETECTION & CONTRAST ANALYSIS (EasyOCR)")
+    logger.info("=" * 60 + "\n")
 
-    # Scan directory
+    detector = OCRPreprocessing(source_directory=source_dir)
     detector.scan_directory()
-    detector.save_reports()
+
+    save = TextClassification(source_directory=source_dir)
+    save.results = detector.results
+    save.save_reports()
+    logger.info("OCR step completed successfully")
+
     return detector.text_detected_dir
 
 
 async def main():
-    """Main integrated workflow"""
-    print("\n" + "=" * 80)
-    print("INTEGRATED IMAGE CRAWLER & TEXT DETECTOR (EasyOCR + WCAG)")
-    print("=" * 80 + "\n")
+    logger.info("=" * 80)
+    logger.info("INTEGRATED IMAGE CRAWLER & TEXT DETECTOR STARTED")
+    logger.info("=" * 80)
 
-    # Configuration
-    parser = argparse.ArgumentParser(description="Integrated Image Crawler and Text Detector")
-    parser.add_argument("url", nargs="?", default="https://www.kao.com/global/en/", help="Target URL to crawl")
-    parser.add_argument("--depth", type=int, default=0, help="Max crawl depth (0=single page)")
-    args = parser.parse_args()
+    website_url = config["input"]["url"]
+    max_crawl_depth = config["input"]["max_depth"]
+    output_dir = config["input"]["output_dir"]
 
-    website_url = args.url
-    max_crawl_depth = args.depth
+    logger.info("Configuration values:")
+    logger.info(f"  URL: {website_url}")
+    logger.info(f"  Max depth: {max_crawl_depth}")
+    logger.info(f"  Output dir: {output_dir}")
 
-    print(f"Configuration:")
-    print(f"  Target URL: {website_url}")
-    print(f"  Max Crawl Depth: {max_crawl_depth}")
-    print(f"  OCR Provider: EasyOCR")
-    print()
+    if not website_url:
+        logger.error("URL missing in config.yaml under 'input'")
+        print("✗ No URL found in config.yaml under 'input'")
+        sys.exit(1)
 
-    # Step 1: Crawl website for images
-    crawl_output_dir = await run_crawler(website_url, max_crawl_depth)
+
+    # STEP 1: Crawl
+    crawl_output_dir   = await run_crawler(
+        website_url,
+        max_depth=max_crawl_depth
+    )
 
     if not crawl_output_dir:
-        print("\n✗ Crawling failed. Exiting.")
+        logger.error("Crawling failed — exiting workflow")
         sys.exit(1)
 
-    print(f"\n✓ Crawling complete. Files saved to: {crawl_output_dir}")
+    logger.info(f"Crawling complete. Output: {crawl_output_dir}")
 
-    # Step 2: Detect text in crawled images using EasyOCR
-    text_detection_dir = run_text_detector(crawl_output_dir)
+    # STEP 2: OCR
+    text_detection_dir = run_text_detector(
+        crawl_output_dir
+    )
 
     if not text_detection_dir:
-        print("\n✗ Text detection failed.")
+        logger.error("Text detection failed")
         sys.exit(1)
 
-    # Final summary
+    logger.info(f"OCR complete. Output: {text_detection_dir}")
+
     print("\n" + "=" * 80)
     print("WORKFLOW COMPLETE ✅")
     print("=" * 80)
-    print("\nOutputs:")
+    print(f"\nOutputs:")
     print(f"  1. Crawled files: {crawl_output_dir}/")
     print(f"  2. Text detection & Contrast: {text_detection_dir}/")
     print(f"  3. Crawl report: {crawl_output_dir}/images_report.json")
     print(f"  4. Detection report: {text_detection_dir}/text_detection_report.json")
-    print("\nLogs:")
-    print(f"  - Text detector log: text_detection.log")
     print("=" * 80 + "\n")
+    logger.info("Workflow completed successfully")
 
 
 if __name__ == "__main__":

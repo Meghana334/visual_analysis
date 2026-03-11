@@ -79,6 +79,42 @@ def extract_adjacent_text_pixels(img_rgb, bbox, padding=6):
 
     return region[mask]
 
+def extract_colors_from_mask(region: np.ndarray,
+                             mask: np.ndarray,
+                             k_bg: int = 3) -> dict:
+    """
+    Extract foreground and background colors using segmentation mask.
+
+    mask == 255 → text
+    mask == 0   → background
+    """
+
+    if region is None or mask is None:
+        return {"error": "Region or mask missing"}
+
+    # Convert BGR → RGB
+    region_rgb = cv2.cvtColor(region, cv2.COLOR_BGR2RGB)
+
+    text_pixels = region_rgb[mask == 255]
+    bg_pixels = region_rgb[mask == 0]
+
+    if len(text_pixels) == 0 or len(bg_pixels) == 0:
+        return {"error": "Invalid segmentation"}
+
+    # ---------- FOREGROUND ----------
+    fg_clusters = cluster_colors(text_pixels, k=2)
+
+    # Choose dominant cluster (most %)
+    fg_color = max(fg_clusters, key=lambda c: c["percent"])
+
+    # ---------- BACKGROUND ----------
+    bg_clusters = cluster_colors(bg_pixels, k=k_bg)
+
+    return {
+        "foreground": fg_color,
+        "background_palette": bg_clusters
+    }
+
 
 # -------------------------
 # Text color extraction

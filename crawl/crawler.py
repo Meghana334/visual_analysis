@@ -10,44 +10,16 @@ import time
 from typing import Optional, List, Set
 from pydantic import BaseModel, Field
 from datetime import datetime
-import logging
-import sys
 import aiohttp
 from crawl.models import ImageData
-from image_processing.classify_assets import ClassifyAssets, ImageClassification
+from config.logger import setup_logger
+from image_processing.classify_assets import ClassifyAssets
+from utils.helper_modules.config_helper import load_config
+CONFIG = load_config()
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('crawler_debug.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
-
-class ImageData(BaseModel):
-    """Data structure for a single image"""
-    url: str
-    src: str
-    alt_text: str = ""
-    title: str = ""
-    classification: str
-    sub_type: Optional[str] = None
-    is_functional: bool = False
-    is_decorative: bool = False
-    is_complex: bool = False
-    is_text_image: bool = False
-    is_logo: bool = False
-    is_icon: bool = False
-    is_chart: bool = False
-    is_button: bool = False
-    file_format: Optional[str] = None
-    screenshot_path: str
-    filename: str
+logger = setup_logger(name="KAC", tag="crawler")
+logger.info("Logger initialized")
 
 
 class CrawlSummary(BaseModel):
@@ -89,81 +61,56 @@ class _ClassificationResult:
 
 
 class AsyncImageCrawler:
-    def __init__(self, base_url: str, output_dir: str = "crawled_images",
-                 include_data_uris: bool = False,
-                 include_invisible: bool = False):
-        logger.info(f"Initializing AsyncImageCrawler with base_url={base_url}")
+    def __init__(
+        self,
+        base_url: str,
+        max_depth:int):
+        self.base_url = base_url
+        self.max_depth = max_depth
+        self.include_invisible = CONFIG["crawler"]["include_invisible"]
+        self.images_data: List[ImageData] = []
+        self.visited_urls: Set[str] = set()
+
+
+        ### Creating unique output directory with domain and timestamp
+        base_output_dir = CONFIG["input"]["output_dir"]   # crawled_images
         domain = urlparse(base_url).netloc.replace('www.', '').replace('.', '_')
-        timestamp = time.strftime('%Y%m%d_%H%M%S')
-        self.output_dir = f"{output_dir}/{domain}_{timestamp}"
+        timestamp = time.strftime('%m%d_%H%M')
+        self.output_dir = f"{base_output_dir}/{domain}_{timestamp}"
 
-        logger.debug(
-            f"output_dir={self.output_dir}, include_data_uris={include_data_uris}, include_invisible={include_invisible}")
-        logger.debug(f"Extracted domain: {domain}")
-        logger.debug(f"Generated timestamp: {timestamp}")
-        logger.info(f"Output directory will be: {self.output_dir}")
-
+        ### Initializing image classifier
         self.classifier = ClassifyAssets(output_dir=self.output_dir)
 
-        self.base_url = base_url
-        logger.debug(f"Set self.base_url to {base_url}")
-
-        self.include_data_uris = include_data_uris
-        logger.debug(f"Set self.include_data_uris to {include_data_uris}")
-
-        self.include_invisible = include_invisible
-        logger.debug(f"Set self.include_invisible to {include_invisible}")
-
-        self.images_data: List[ImageData] = []
-        logger.debug("Initialized empty images_data list")
-
-        self.visited_urls: Set[str] = set()
-        logger.debug("Initialized empty visited_urls set")
-
         # Create directory structure
-        logger.info("Calling _create_directories()")
         self._create_directories()
-
         self.file_handler = None  # basic handler not needed as we handle paths locally
+        logger.info(f"Initializing AsyncImageCrawler with base_url={base_url}")
+
 
     def _create_directories(self):
         """Create all necessary output directories"""
-        logger.info("Starting directory creation")
 
-        directories = [
-            self.output_dir,
-            f"{self.output_dir}/informative",
-            f"{self.output_dir}/decorative",
-            f"{self.output_dir}/functional",
-            f"{self.output_dir}/functional/buttons",
-            f"{self.output_dir}/functional/icons",
-            f"{self.output_dir}/functional/logos",
-            f"{self.output_dir}/functional/images",
-            f"{self.output_dir}/complex",
-            f"{self.output_dir}/complex/charts",
-            f"{self.output_dir}/complex/emojis"
+        base_dir = Path(self.output_dir)
+        directories = [base_dir] + [
+            base_dir / subdir for subdir in CONFIG["directories"]
         ]
-        logger.debug(f"Directory list prepared: {len(directories)} directories")
-
         for directory in directories:
-            logger.debug(f"Creating directory: {directory}")
-            Path(directory).mkdir(parents=True, exist_ok=True)
-            logger.debug(f"✓ Directory created/verified: {directory}")
+            directory.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Successfully created/verified all {len(directories)} directories")
+        logger.info(f"Successfully created :  {directories} directories")
+
 
     async def trigger_lazy_loading(self, page):
         """More aggressive lazy loading trigger"""
         logger.info("Starting lazy loading trigger")
-        print(f"Triggering lazy image loading...")
 
         # Multiple scroll passes with different patterns
-        for scroll_pass in range(3):
-            logger.info(f"Starting scroll pass {scroll_pass + 1}/3")
-            print(f"  Scroll pass {scroll_pass + 1}/3...")
+        scroll_passes = CONFIG["crawler"]["scroll_passes"]
+        for scroll_pass in range(scroll_passes):
+            logger.info(f"Starting scroll pass {scroll_pass + 1}/{scroll_passes}")
 
             # Scroll down in steps
-            logger.debug("Executing scroll down in steps JavaScript")
+            logger.info("Executing scroll down in steps JavaScript")
             await page.evaluate('''() => {
                 const scrollHeight = document.body.scrollHeight;
                 const steps = 5;
@@ -173,25 +120,19 @@ class AsyncImageCrawler:
                     }, i * 200);
                 }
             }''')
-            logger.debug("Scroll JavaScript executed, waiting 2000ms")
             await page.wait_for_timeout(2000)
-            logger.debug("Wait complete after scroll")
 
             # Scroll to middle
-            logger.debug("Scrolling to middle of page")
             await page.evaluate('''() => {
                 window.scrollTo(0, document.body.scrollHeight / 2);
             }''')
-            logger.debug("Waiting 1000ms after middle scroll")
             await page.wait_for_timeout(1000)
-            logger.debug("Middle scroll complete")
+            logger.info("Middle scroll complete")
 
         # Scroll back to top
         logger.info("Scrolling back to top")
         await page.evaluate('window.scrollTo(0, 0)')
-        logger.debug("Waiting 1000ms after scroll to top")
         await page.wait_for_timeout(1000)
-        logger.debug("Scroll to top complete")
 
         # Trigger intersection observers by scrolling images into view
         logger.info("Triggering intersection observers for lazy-loaded images")
@@ -200,11 +141,9 @@ class AsyncImageCrawler:
                 img.scrollIntoView({ behavior: 'instant', block: 'center' });
             });
         }''')
-        logger.debug("Waiting 1500ms for intersection observers")
         await page.wait_for_timeout(1500)
         logger.info("Lazy loading trigger complete")
 
-        print(f"  ✓ Lazy loading complete")
 
     def save_results(self):
         """Save results to JSON file using Pydantic models"""
@@ -345,85 +284,70 @@ class AsyncImageCrawler:
     async def reveal_hidden_images(self, page):
         """Click tabs, accordions, etc. to reveal hidden images"""
         logger.info("Starting reveal_hidden_images")
-        print("Attempting to reveal hidden images...")
 
         revealed_count = 0
 
         # Click all tabs
-        logger.debug("Attempting to click tabs")
+        logger.info("Attempting to expand click tabs")
         try:
-            logger.debug("Locating tab elements")
-            tabs = await page.locator('[role="tab"], .tab, [data-toggle="tab"], .nav-link').all()
+            tabs = await page.locator('[role="tab"], .tab, [data-toggle="tab"], .nav-link').all() #TODO: it is  ststic see all possibility
             logger.info(f"Found {len(tabs)} tab elements")
 
             for idx, tab in enumerate(tabs[:8]):  # Limit to avoid infinite loops
                 logger.debug(f"Processing tab {idx + 1}/8")
                 try:
-                    logger.debug(f"Checking if tab {idx + 1} is visible")
                     if await tab.is_visible(timeout=1000):
-                        logger.debug(f"Tab {idx + 1} is visible, clicking")
                         await tab.click(timeout=2000)
-                        logger.debug(f"Tab {idx + 1} clicked, waiting 500ms")
                         await page.wait_for_timeout(500)
                         revealed_count += 1
                         logger.info(f"Successfully clicked tab {idx + 1}")
                     else:
-                        logger.debug(f"Tab {idx + 1} not visible, skipping")
+                        logger.info(f"Tab {idx + 1} not visible, skipping")
                 except Exception as e:
-                    logger.debug(f"Failed to click tab {idx + 1}: {str(e)}")
+                    logger.info(f"Failed to click tab {idx + 1}: {str(e)}")
                     pass
         except Exception as e:
             logger.warning(f"Error processing tabs: {str(e)}")
             pass
 
         # Expand accordions
-        logger.debug("Attempting to expand accordions")
+        logger.info("Attempting to expand accordions")
         try:
-            logger.debug("Locating accordion elements")
             accordions = await page.locator('[data-toggle="collapse"], .accordion-toggle, .accordion-button').all()
             logger.info(f"Found {len(accordions)} accordion elements")
 
             for idx, accordion in enumerate(accordions[:8]):
-                logger.debug(f"Processing accordion {idx + 1}/8")
                 try:
-                    logger.debug(f"Checking if accordion {idx + 1} is visible")
                     if await accordion.is_visible(timeout=1000):
-                        logger.debug(f"Accordion {idx + 1} is visible, clicking")
                         await accordion.click(timeout=2000)
-                        logger.debug(f"Accordion {idx + 1} clicked, waiting 500ms")
                         await page.wait_for_timeout(500)
                         revealed_count += 1
                         logger.info(f"Successfully clicked accordion {idx + 1}")
                     else:
-                        logger.debug(f"Accordion {idx + 1} not visible, skipping")
+                        logger.info(f"Accordion {idx + 1} not visible, skipping")
                 except Exception as e:
-                    logger.debug(f"Failed to click accordion {idx + 1}: {str(e)}")
+                    logger.info(f"Failed to click accordion {idx + 1}: {str(e)}")
                     pass
         except Exception as e:
             logger.warning(f"Error processing accordions: {str(e)}")
             pass
 
         # Click carousel/slider controls
-        logger.debug("Attempting to click carousel controls")
+        logger.info("Attempting to click carousel controls")
         try:
-            logger.debug("Locating carousel button elements")
             carousel_btns = await page.locator(
                 '.carousel-control, .slider-next, .slick-next, [data-slide="next"]').all()
             logger.info(f"Found {len(carousel_btns)} carousel control elements")
 
             for idx, btn in enumerate(carousel_btns[:5]):
-                logger.debug(f"Processing carousel button {idx + 1}/5")
                 try:
-                    logger.debug(f"Checking if carousel button {idx + 1} is visible")
                     if await btn.is_visible(timeout=1000):
-                        logger.debug(f"Carousel button {idx + 1} is visible, clicking")
                         await btn.click(timeout=2000)
-                        logger.debug(f"Carousel button {idx + 1} clicked, waiting 500ms")
                         await page.wait_for_timeout(500)
                         revealed_count += 1
                         logger.info(f"Successfully clicked carousel button {idx + 1}")
                     else:
-                        logger.debug(f"Carousel button {idx + 1} not visible, skipping")
+                        logger.info(f"Carousel button {idx + 1} not visible, skipping")
                 except Exception as e:
                     logger.debug(f"Failed to click carousel button {idx + 1}: {str(e)}")
                     pass
@@ -431,8 +355,8 @@ class AsyncImageCrawler:
             logger.warning(f"Error processing carousel controls: {str(e)}")
             pass
 
+        ### Total count
         logger.info(f"reveal_hidden_images complete. Revealed {revealed_count} elements")
-        print(f"  ✓ Clicked {revealed_count} interactive elements")
 
     async def is_actually_visible(self, element, page):
         """More comprehensive visibility check"""
@@ -454,7 +378,7 @@ class AsyncImageCrawler:
                     srcOk: srcOk,
                 };
             }''')
-            logger.debug(f"Visibility check result: {visibility}")
+            logger.info(f"Visibility check result: {visibility}")
 
             is_visible = (
                     visibility['hasSize'] and
@@ -463,192 +387,171 @@ class AsyncImageCrawler:
                     visibility['hasOpacity'] and
                     visibility['srcOk']
             )
-            logger.debug(f"Element visibility final result: {is_visible}")
+            logger.info(f"Element visibility final result: {is_visible}")
             return is_visible
 
         except Exception as e:
             logger.warning(f"Error checking visibility: {str(e)}")
             return False
 
-    async def crawl_page(self, url: str, max_depth: int = 2, current_depth: int = 0):
+    async def crawl_page(self, current_depth: int = 0):
         """Crawl a single page and extract images"""
-        logger.info(f"Starting crawl_page: url={url}, max_depth={max_depth}, current_depth={current_depth}")
+        logger.info(f"Starting crawl_page: url={self.base_url}, max_depth={self.max_depth}, current_depth={current_depth}")
 
-        if url in self.visited_urls or current_depth > max_depth:
-            logger.warning(f"Skipping {url}: already visited or max depth exceeded")
+        if self.base_url in self.visited_urls or current_depth > self.max_depth:
+            logger.info(f"Skipping {self.base_url}: already visited or max depth exceeded")
             return
 
-        logger.info(f"Adding {url} to visited_urls")
-        self.visited_urls.add(url)
+        logger.info(f"Adding {self.base_url} to visited_urls")
+        self.visited_urls.add(self.base_url)
 
-        print(f"\n{'=' * 60}")
-        print(f"Crawling: {url}")
-        print(f"Depth: {current_depth}/{max_depth}")
-        print(f"{'=' * 60}")
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Crawling: {self.base_url}")
+        logger.info(f"Depth: {current_depth}/{self.max_depth}")
+        logger.info(f"{'=' * 60}")
 
         logger.info("Initializing Playwright")
         async with async_playwright() as p:
-            logger.debug("Launching Chromium browser")
+            logger.info("Launching Chromium browser")
             browser = await p.chromium.launch(headless=True)
-            logger.debug("Browser launched successfully")
+            logger.info("Browser launched successfully")
 
-            logger.debug("Creating browser context")
+            logger.info("Creating browser context")
             context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
+                viewport={'width': CONFIG['crawl_browser']['width'], 'height': CONFIG['crawl_browser']['HEIGHT']},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
-            logger.debug("Browser context created")
-
-            logger.debug("Creating new page")
             page = await context.new_page()
-            logger.debug("Page created")
+            logger.info("Browser context and Page created")
+
 
             # Set longer timeout for slow pages
-            logger.debug("Setting default timeout to 60000ms")
+            logger.info("Setting default timeout to 60000ms")
             page.set_default_timeout(60000)
 
             try:
                 # Try different wait strategies
-                print(f"Loading page...")
-                logger.info(f"Attempting to load page: {url}")
+                logger.info(f"Attempting to load page: {self.base_url}")
                 try:
-                    logger.debug("Trying domcontentloaded wait strategy")
-                    await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                    await page.goto(self.base_url, wait_until='domcontentloaded', timeout=60000)
                     logger.info("✓ DOM loaded successfully")
-                    print(f"✓ DOM loaded")
                 except Exception as e:
-                    logger.warning(f"domcontentloaded failed: {str(e)}")
-                    print(f"Warning: {str(e)}")
-                    print(f"Trying alternative loading strategy...")
-                    logger.debug("Trying 'load' wait strategy")
-                    await page.goto(url, wait_until='load', timeout=60000)
+                    logger.info(f"domcontentloaded failed: {str(e)}")
+                    logger.info("Trying 'load' wait strategy")
+
+                    await page.goto(self.base_url, wait_until='load', timeout=60000)
                     logger.info("✓ Page loaded with 'load' strategy")
 
                 # Wait for images to load
-                logger.debug("Waiting 3000ms for images to load")
+                logger.info("Waiting 3000ms for images to load")
                 await page.wait_for_timeout(3000)
-                logger.debug("Initial wait complete")
+                logger.info("Initial wait complete")
 
-                # Better lazy loading
-                logger.info("Triggering lazy loading")
+                # Better lazy loading ( Scrolling webpage of the url )
                 await self.trigger_lazy_loading(page)
 
                 # Reveal hidden content
-                logger.info("Revealing hidden images")
                 await self.reveal_hidden_images(page)
 
                 # Wait for new images to load
-                # Wait for new images to load
-                logger.debug("Waiting 2000ms for newly revealed images")
+                logger.info("Waiting 2000ms for newly revealed images")
                 await page.wait_for_timeout(2000)
-                logger.debug("Final wait complete")
+                logger.info("Final wait complete")
 
-                # === GLOBAL ASSET EXTRACTION ===
-                # Removed per user request to use only Playwright and skip global assets
 
                 # Find all images
                 logger.info("Locating all <img> elements on page")
                 images = await page.locator('img').all()
                 logger.info(f"✓ Found {len(images)} <img> elements")
-                print(f"\n✓ Found {len(images)} <img> elements")
 
                 if len(images) == 0:
-                    logger.warning("No images found on page")
-                    print(f"⚠ No images found. Page may use background images or lazy loading.")
+                    logger.info("No images found on page")
 
-                # Process each image
+                # Process each urlimage
                 skipped_invisible = 0
                 skipped_no_src = 0
-                skipped_data_uri = 0
-                skipped_no_dimensions = 0
-                data_uri_count = 0
+
+
+
+
+
+
+
+
+
 
                 logger.info(f"Starting to process {len(images)} images")
                 for idx, img in enumerate(images):
-                    logger.debug(f"\n{'=' * 40}")
-                    logger.debug(f"Processing image {idx + 1}/{len(images)}")
+                    logger.info(f"\n{'=' * 40}")
+                    logger.info(f"Processing image {idx + 1}/{len(images)}")
                     try:
                         # === IMPROVED VISIBILITY CHECK ===
                         if not self.include_invisible:
-                            logger.debug("Checking image visibility (include_invisible=False)")
+                            logger.info("Checking image visibility (include_invisible=False)")
                             try:
                                 is_visible = await self.is_actually_visible(img, page)
                                 if not is_visible:
-                                    logger.debug(f"Image {idx + 1} is not visible, skipping")
+                                    logger.info(f"Image {idx + 1} is not visible, skipping")
                                     skipped_invisible += 1
                                     continue
-                                logger.debug(f"Image {idx + 1} is visible")
+                                logger.info(f"Image {idx + 1} is visible")
                             except Exception as visibility_error:
                                 logger.warning(f"Visibility check failed for image {idx + 1}: {str(visibility_error)}")
                                 skipped_invisible += 1
                                 continue
 
                         # Get image properties
-                        logger.debug("Getting image src attribute")
                         src = await img.get_attribute('src')
                         if not src:
-                            logger.debug("No src attribute, checking data-src and data-lazy-src")
+                            logger.info("No src attribute, checking data-src and data-lazy-src")
                             # Try data-src for lazy loaded images
                             src = await img.get_attribute('data-src') or await img.get_attribute('data-lazy-src')
 
                         if not src:
-                            logger.debug(f"Image {idx + 1} has no src, skipping")
+                            logger.info(f"Image {idx + 1} has no src, skipping")
                             skipped_no_src += 1
                             continue
 
-                        logger.debug(f"Image src: {src[:50]}...")
-
-                        # Handle data URIs
-                        if src.startswith('data:'):
-                            if not self.include_data_uris:
-                                logger.debug(f"Image {idx + 1} is a data URI - SKIPPING per user request")
-                                skipped_data_uri += 1
-                                continue
-                            else:
-                                logger.debug(f"Image {idx + 1} is a data URI - Including")
-
                         # Make absolute URL
-                        logger.debug("Converting to absolute URL")
-                        absolute_src = urljoin(url, src)
-                        logger.debug(f"Absolute URL: {absolute_src[:50]}...")
+                        absolute_src = urljoin(self.base_url, src)
 
                         # Get image info
-                        logger.debug("Getting alt text and title")
                         alt_text = await img.get_attribute('alt') or ''
                         title = await img.get_attribute('title') or ''
 
                         # Classify image
-                        print(f"\n  [{idx + 1}/{len(images)}] Analyzing image...")
-                        logger.info(f"Classifying image {idx + 1}")
                         classification_dict = await self.classifier.classify_image(img)
                         classification = _ClassificationResult(classification_dict)
 
                         # Generate unique filename
-                        logger.debug("Generating filename")
                         img_hash = self.classifier.get_image_hash(absolute_src)
                         filename = f"img_{img_hash}.png"
-                        logger.debug(f"Filename: {filename}")
 
-                        # Determine directory based on classification
-                        logger.debug("Determining output directory based on classification")
+                        sub_path = None
 
-                        if classification.type == 'complex':
-                            img_dir = f"{self.output_dir}/complex/{classification.sub_type or 'charts'}"
-                        elif classification.type == 'functional':
-                            img_dir = f"{self.output_dir}/functional/{classification.sub_type or 'images'}"
-                        elif classification.is_text_image and not classification.is_functional:
-                            img_dir = f"{self.output_dir}/text_images"
+                        if classification.type == "functional":
+                            sub_path = f"functional/{classification.sub_type or 'images'}"
+
+                        elif classification.type == "complex":
+                            sub_path = f"complex/{classification.sub_type or 'charts'}"
+
                         else:
-                            img_dir = f"{self.output_dir}/{classification.type}"
+                            sub_path = classification.type  # informative / decorative
 
-                        logger.debug(f"Output directory: {img_dir}")
+                        img_dir = os.path.join(self.output_dir, sub_path)
+
+                        # Ensure directory exists (only if declared in config)
+                        allowed_dirs = set(CONFIG["directories"])
+
+                        if sub_path not in allowed_dirs:
+                            img_dir = os.path.join(self.output_dir, classification.type)
                         os.makedirs(img_dir, exist_ok=True)
 
                         screenshot_path = f"{img_dir}/{filename}"
-                        logger.debug(f"Full screenshot path: {screenshot_path}")
+                        logger.info(f"Full screenshot path: {screenshot_path}")
 
                         # === CHECK FOR OVERLAY CONTAINER ===
-                        logger.debug("Checking for overlay container")
+                        logger.info("Checking for overlay container")
                         is_overlay_container = False
                         container = img  # default to img itself
 
@@ -661,7 +564,7 @@ class AsyncImageCrawler:
                             if is_overlay_container:
                                 container = container_handle
                                 logger.info("Overlay container detected — will screenshot container instead of image")
-                                print("    Overlay container detected")
+
                         except Exception as e:
                             logger.warning(f"Error checking for overlay container: {e}")
 
@@ -690,7 +593,6 @@ class AsyncImageCrawler:
 
                                 if downloaded:
                                     logger.info(f"✓ Icon downloaded: {screenshot_path}")
-                                    print(f"  ✓ Downloaded icon: {filename}")
                                 else:
                                     # Fallback: screenshot the nearest visible parent container
                                     logger.warning(f"Icon download failed, falling back to parent screenshot")
@@ -702,7 +604,6 @@ class AsyncImageCrawler:
                                         )
                                         await parent_handle.screenshot(path=screenshot_path)
                                         logger.info(f"✓ Parent screenshot taken: {screenshot_path}")
-                                        print(f"  ✓ Parent screenshot (icon fallback): {filename}")
                                     except Exception as pe:
                                         logger.error(f"Icon parent screenshot failed: {pe}")
                                         continue
@@ -722,7 +623,6 @@ class AsyncImageCrawler:
 
                                 if downloaded:
                                     logger.info(f"✓ Button-image downloaded: {screenshot_path}")
-                                    print(f"  ✓ Downloaded button-image: {filename}")
                                 else:
                                     # Fallback: screenshot the img itself
                                     logger.warning(f"Button-image download failed, falling back to screenshot")
@@ -730,21 +630,16 @@ class AsyncImageCrawler:
                                     filename = f"img_{img_hash}.png"
                                     await img.screenshot(path=screenshot_path)
                                     logger.info(f"✓ Button-image screenshot (fallback): {screenshot_path}")
-                                    print(f"  ✓ Screenshot (button-image fallback): {filename}")
 
                             elif classification.is_logo:
                                 # Screenshot logos in page context
-                                logger.debug(f"Taking screenshot (logo) to {screenshot_path}")
                                 await img.screenshot(path=screenshot_path)
                                 logger.info(f"✓ Screenshot taken (logo): {screenshot_path}")
-                                print(f"  ✓ Screenshot saved (logo): {filename}")
 
                             elif is_overlay_container:
                                 # Plain image with overlay text → screenshot the container
-                                logger.debug(f"Taking screenshot (overlay container) to {screenshot_path}")
                                 await container.screenshot(path=screenshot_path)
                                 logger.info(f"✓ Screenshot taken (overlay): {screenshot_path}")
-                                print(f"  ✓ Screenshot saved (overlay container): {filename}")
 
                             else:
                                 # Plain image — download original file, preserve extension
@@ -761,35 +656,32 @@ class AsyncImageCrawler:
 
                                 if success:
                                     logger.info(f"✓ Image downloaded: {screenshot_path}")
-                                    print(f"  ✓ Downloaded: {filename}")
                                 else:
-                                    logger.warning(f"Failed to download {absolute_src}, skipping")
-                                    print(f"  ✗ Failed to download: {filename}")
+                                    logger.info(f"Failed to download {absolute_src}, skipping")
                                     continue  # skip storing this image
 
                             # Print classification details
-                            print(f"    Type: {classification.type}")
+                            logger.info(f"    Type: {classification.type}")
                             if classification.sub_type:
-                                print(f"    Sub-type: {classification.sub_type}")
+                                logger.info(f"    Sub-type: {classification.sub_type}")
                             if classification.is_logo:
-                                print(f"    Logo: Yes")
+                                logger.info(f"    Logo: Yes")
                             if classification.is_icon:
-                                print(f"    Icon: Yes")
+                                logger.info(f"    Icon: Yes")
                             if classification.is_button:
-                                print(f"    Button Image: Yes")
+                                logger.info(f"    Button Image: Yes")
                             if alt_text:
-                                print(f"    Alt text: {alt_text[:60]}{'...' if len(alt_text) > 60 else ''}")
+                                logger.info(f"    Alt text: {alt_text[:60]}{'...' if len(alt_text) > 60 else ''}")
 
                         except Exception as e:
                             logger.error(f"Failed to capture image {idx + 1}: {str(e)}")
-                            print(f"  ✗ Failed to capture {filename}: {str(e)}")
                             continue
 
                         # Store image data using Pydantic model
-                        logger.debug("Creating ImageData object")
+                        logger.info("Creating ImageData object")
                         image_data = ImageData(
-                            url=url,
-                            src=absolute_src,
+                            url=self.base_url,
+                            src=self.base_url,
                             alt_text=alt_text,
                             title=title,
                             classification=classification.type,
@@ -806,34 +698,69 @@ class AsyncImageCrawler:
                             filename=filename
                         )
 
-                        logger.debug("Adding image to images_data list")
                         self.images_data.append(image_data)
                         logger.info(f"✓ Successfully processed image {idx + 1}")
 
                     except Exception as e:
                         logger.error(f"Error processing image {idx}: {str(e)}")
-                        print(f"  ✗ Error processing image {idx}: {str(e)}")
                         continue
 
-                # Print skip statistics
-                logger.info("Image processing complete, printing summary")
-                print(f"\n{'=' * 60}")
-                print(f"IMAGE PROCESSING SUMMARY:")
-                print(f"  Total found: {len(images)}")
-                print(f"  Successfully captured: {len([img for img in self.images_data if img.url == url])}")
-                if self.include_data_uris:
-                    print(f"    - Data URIs: {data_uri_count}")
-                    print(
-                        f"    - Regular images: {len([img for img in self.images_data if img.url == url]) - data_uri_count}")
-                print(f"  Skipped - Invisible: {skipped_invisible}")
-                print(f"  Skipped - No dimensions: {skipped_no_dimensions}")
-                print(f"  Skipped - No src: {skipped_no_src}")
-                if not self.include_data_uris:
-                    print(f"  Skipped - Data URI: {skipped_data_uri}")
-                print(f"{'=' * 60}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                # # Print skip statistics
+                # logger.info("Image processing complete, printing summary")
+                # print(f"\n{'=' * 60}")
+                # print(f"IMAGE PROCESSING SUMMARY:")
+                # print(f"  Total found: {len(images)}")
+                # print(f"  Successfully captured: {len([img for img in self.images_data if img.url == url])}")
+                # if self.include_data_uris:
+                #     print(f"    - Data URIs: {data_uri_count}")
+                #     print(
+                #         f"    - Regular images: {len([img for img in self.images_data if img.url == url]) - data_uri_count}")
+                # print(f"  Skipped - Invisible: {skipped_invisible}")
+                # print(f"  Skipped - No dimensions: {skipped_no_dimensions}")
+                # print(f"  Skipped - No src: {skipped_no_src}")
+                # if not self.include_data_uris:
+                #     print(f"  Skipped - Data URI: {skipped_data_uri}")
+                # print(f"{'=' * 60}")
 
                 logger.info(
-                    f"Summary - Total: {len(images)}, Captured: {len([img for img in self.images_data if img.url == url])}, Skipped: {skipped_invisible + skipped_no_src + skipped_data_uri}")
+                    f"Summary - Total: {len(images)}, Captured: {len([img for img in self.images_data if img.url == self.base_url])}, Skipped: {skipped_invisible + skipped_no_src }")
 
                 # ═══════════════════════════════════════════════════════
                 # BUTTON EXTRACTION PASS
@@ -918,8 +845,8 @@ class AsyncImageCrawler:
 
                         # Store in images_data
                         image_data = ImageData(
-                            url=url,
-                            src=url,  # buttons have no src
+                            url=self.base_url,
+                            src=self.base_url,  # buttons have no src
                             alt_text=btn_info['text'],
                             title=btn_info['text'],
                             classification='functional',
@@ -940,17 +867,14 @@ class AsyncImageCrawler:
                     except Exception as e:
                         logger.debug(f"Failed to capture button {btn_idx+1}: {e}")
                         continue
-
-                print(f"  Buttons captured: {captured_btns}/{len(btn_elements)}")
                 logger.info(f"Button extraction complete: {captured_btns} captured")
 
                 # Find links for crawling (optional)
-                if current_depth < max_depth:
-                    logger.info(f"Current depth {current_depth} < max depth {max_depth}, finding links")
+                if current_depth < self.max_depth:
+                    logger.info(f"Current depth {current_depth} < max depth {self.max_depth}, finding links")
                     print(f"\n{'=' * 60}")
                     print(f"Finding links for deeper crawling...")
 
-                    logger.debug("Locating all <a> elements")
                     links = await page.locator('a[href]').all()
                     logger.info(f"Found {len(links)} links")
 
@@ -962,7 +886,7 @@ class AsyncImageCrawler:
                             href = await link.get_attribute('href')
                             if href:
                                 logger.debug(f"Link href: {href}")
-                                absolute_url = urljoin(url, href)
+                                absolute_url = urljoin(self.base_url, href)
                                 logger.debug(f"Absolute URL: {absolute_url}")
 
                                 # Only crawl same domain
@@ -977,7 +901,7 @@ class AsyncImageCrawler:
                                         await browser.close()
 
                                         logger.info(f"Recursively crawling: {absolute_url}")
-                                        await self.crawl_page(absolute_url, max_depth, current_depth + 1)
+                                        await self.crawl_page(absolute_url, self.max_depth, current_depth + 1)
 
                                         logger.debug("Relaunching browser after recursive crawl")
                                         browser = await p.chromium.launch(headless=True)
@@ -987,30 +911,28 @@ class AsyncImageCrawler:
                                         )
                                         page = await context.new_page()
                                         page.set_default_timeout(60000)
-                                        await page.goto(url, wait_until='domcontentloaded')
+                                        await page.goto(self.base_url, wait_until='domcontentloaded')
                                     else:
-                                        logger.debug(f"Link already visited: {absolute_url}")
+                                        logger.info(f"Link already visited: {absolute_url}")
                                 else:
-                                    logger.debug(f"Link is different domain, skipping: {absolute_url}")
+                                    logger.info(f"Link is different domain, skipping: {absolute_url}")
                         except Exception as e:
                             logger.warning(f"Error processing link {link_idx + 1}: {str(e)}")
                             continue
 
                     logger.info(f"Found {link_count} new links to crawl")
-                    print(f"Found {link_count} new links to crawl")
 
             except Exception as e:
-                logger.error(f"Error crawling {url}: {str(e)}")
-                print(f"\n✗ Error crawling {url}: {str(e)}")
+                logger.error(f"Error crawling {self.base_url}: {str(e)}")
                 import traceback
                 traceback.print_exc()
 
             finally:
-                logger.debug("Closing browser context")
+                logger.info("Closing browser context")
                 await context.close()
-                logger.debug("Closing browser")
+                logger.info("Closing browser")
                 await browser.close()
-                logger.info(f"Finished crawling {url}")
+                logger.info(f"Finished crawling {self.base_url}")
 
 
 async def main():
@@ -1062,7 +984,12 @@ async def main():
         traceback.print_exc()
 
 
-if __name__ == "__main__":
-    logger.info("Starting main program")
-    asyncio.run(main())
-    logger.info("Program finished")
+
+#
+#
+# if __name__ == "__main__":
+#     logger.info("Starting main program")
+#     asyncio.run(main())
+#     logger.info("Program finished")
+
+

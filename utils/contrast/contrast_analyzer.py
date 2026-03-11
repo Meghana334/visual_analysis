@@ -170,6 +170,8 @@ def analyze_text_region(
         compliance = check_wcag_compliance(ratio)
 
         return {
+            "region": region,
+            "mask": mask,
             "foreground_color": fg_rgb,
             "background_color": bg_rgb,
             "luminance_fg": round(text_L, 4),
